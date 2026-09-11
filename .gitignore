@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+
+# 本地私有配置（含邮箱授权码）—— 不要提交！
+local_config.py
+
+# 运行时产物
+data.db
+data.db-wal
+data.db-shm
+logs/
+cron.log
+preview.html
+preview_alert.html
+preview_all_bands.html
+preview_delta_colors.html
