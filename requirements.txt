@@ -1,0 +1,6 @@
+# 固定版本：akshare 接口变动频繁，升级可能破坏取数（如旧接口被移除）。
+# 若升级 akshare，请先回归测试 main.py 的取数与评分。
+akshare==1.18.94
+matplotlib==3.11.1
+pandas==3.0.5
+numpy==2.5.3
