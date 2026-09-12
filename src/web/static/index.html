@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>指数估值评分</title>
+<link rel="stylesheet" href="/static/style.css?v=47">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="logo">📈</span>
+      <div>
+        <h1>指数估值评分</h1>
+        <p class="sub" id="app-sub">加载中…</p>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-module="dashboard">首页</button>
+      <button class="nav-item" data-module="assets">标的信息</button>
+      <button class="nav-item" data-module="targets">指数与组合</button>
+      <button class="nav-item" data-module="stocks">个股管理</button>
+      <button class="nav-item" data-module="settings">设置</button>
+    </nav>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<main id="main"></main>
+
+<footer>
+  <span id="foot">—</span>
+  <span class="muted">· 数据源 baostock · 接口文档 <a href="/api/docs" target="_blank">/api/docs</a></span>
+</footer>
+
+<script src="/static/vendor/echarts.min.js?v=47"></script>
+<script src="/static/api.js?v=47"></script>
+<script src="/static/charts.js?v=47"></script>
+<script src="/static/asset-view.js?v=47"></script>
+<script src="/static/modules/dashboard.js?v=47"></script>
+<script src="/static/modules/assets.js?v=47"></script>
+<script src="/static/modules/targets.js?v=47"></script>
+<script src="/static/modules/stocks.js?v=47"></script>
+<script src="/static/modules/settings.js?v=47"></script>
+<script src="/static/app.js?v=47"></script>
+</body>
+</html>
