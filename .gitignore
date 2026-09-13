@@ -5,13 +5,17 @@ __pycache__/
 # 本地私有配置（含邮箱授权码）—— 不要提交！
 local_config.py
 
+# 数据库（setting 表内含 SMTP 授权码等敏感信息）—— 绝对不要提交！
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # 运行时产物
-data.db
-data.db-wal
-data.db-shm
 logs/
 cron.log
 preview.html
 preview_alert.html
 preview_all_bands.html
 preview_delta_colors.html
+palette_preview.html
