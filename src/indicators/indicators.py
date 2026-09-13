@@ -677,7 +677,34 @@ def index_score(conn, index_code: str, years: int | None = None,
     return result
 
 
-def rebuild_portfolio(conn, code: str, freq: str = "M",
+def rebuild_scores(conn, code: str, ktype: str | None = None,
+                   freq: str = "D") -> dict:
+    """「立即重算评分」：**删掉该标的已算好的分位/评分，再整条重建 + 重算当日**。
+
+    这是「重算组合」去掉"补数据 + 合成组合K线"之后的那一半，两者**共用**它，
+    所以两个按钮的后半段行为完全一致（以前是各写各的：组合会重建历史，
+    而"重算评分"只 upsert 当日一条，按钮名和实际行为不符）。
+
+    freq 默认 **D（每交易日）**：与日常「计算指标」任务一致。
+    以前组合重算用的是 'M'（月频），导致同一张走势图被两个按钮搞成不同密度。
+
+    先 delete_scores 再 clean=False 重建，避免"删了又让 rebuild 再删一遍"。
+    """
+    t = config.target(code)
+    ktype = ktype or (t["ktype"] if t else None) or "stock"
+    d_score = storage.delete_scores(conn, code)
+    n_hist = rebuild_score_history(conn, code, ktype, freq=freq, clean=False)
+    score_fn = {"index": index_score, "portfolio": portfolio_score}.get(
+        ktype, stock_score)
+    r = score_fn(conn, code, save=True)
+    log.info("%s 评分重算完成（删除旧评分 %d 条）：历史 %d 条，当日评分 %s",
+             code, d_score, n_hist, (r or {}).get("score"))
+    return {"deleted_score": d_score, "history_rows": n_hist,
+            "score": (r or {}).get("score"), "ktype": ktype,
+            "status": (r or {}).get("status")}
+
+
+def rebuild_portfolio(conn, code: str, freq: str = "D",
                       history: bool = True, full: bool = True) -> dict:
     """重算组合的**全部派生数据**：K线 → 指标 → 指标分位 → 综合评分。
 
@@ -698,19 +725,19 @@ def rebuild_portfolio(conn, code: str, freq: str = "M",
         log.warning("%s 无成分股，跳过组合重算", code)
         return {"kline_rows": 0, "score_rows": 0, "score": None,
                 "constituents": 0, "deleted_kline": 0, "deleted_score": 0}
-    d_kline = d_score = 0
+    d_kline = 0
     if full:
         d_kline = storage.delete_kline(conn, code)
-        d_score = storage.delete_scores(conn, code)
     n_kline = rebuild_portfolio_kline(conn, code)
-    n_hist = rebuild_score_history(conn, code, "portfolio",
-                                   freq=freq) if history else 0
-    r = portfolio_score(conn, code, save=True)
+    # ③④ 删旧评分 → 重建历史 → 当日评分：与「立即重算评分」**共用同一个函数**
+    sc = rebuild_scores(conn, code, "portfolio", freq=freq) if history else {}
+    d_score = sc.get("deleted_score", 0)
+    n_hist = sc.get("history_rows", 0)
     log.info("%s 组合重算完成（删除旧数据 K线 %d / 评分 %d）："
              "K线 %d 个交易日，历史评分 %d 条，当日评分 %s",
-             code, d_kline, d_score, n_kline, n_hist, (r or {}).get("score"))
+             code, d_kline, d_score, n_kline, n_hist, sc.get("score"))
     return {"kline_rows": n_kline, "score_rows": n_hist,
-            "score": (r or {}).get("score"), "constituents": len(codes),
+            "score": sc.get("score"), "constituents": len(codes),
             "deleted_kline": d_kline, "deleted_score": d_score}
 
 
@@ -937,9 +964,11 @@ def rebuild_score_history(conn, code: str, ktype: str = "index",
                    for m in METRICS}
                   if years_ref and years_ref != years else p10)
         for d in sampled:
-            w = weight_by_date.get(d, {}).get(c) if is_index else 1.0
-            if not w:
-                continue
+            # 现在 codes 只有标的自己，权重恒为 1（不再按成分股逐日加权）。
+            # 注意别再写成 `weight_by_date.get(...) if is_index else 1.0` ——
+            # weight_by_date 已置空，指数分支会取到 0 然后 `if not w: continue`，
+            # 结果是**一行都不写**、把指数历史清空。
+            w = 1.0
             hit = False
             for m in METRICS:
                 v10 = p10[m].get(d)

@@ -380,7 +380,7 @@ def ensure_constituent_data(conn, codes, wait: bool = False) -> dict:
 
 
 def rebuild_portfolio(conn, code: str, sync: bool = True,
-                      freq: str = "M") -> dict:
+                      freq: str = "D") -> dict:
     """「重算组合」：**先把成分股数据补齐，再删旧数据全量重算**。
 
     ① 检查成分股的 K 线/分红/元数据是否最新，落后就增量拉取

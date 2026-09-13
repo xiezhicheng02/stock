@@ -58,23 +58,27 @@ def sync_stock(code: str, full: bool = False, _: None = Depends(deps.require_aut
     return r
 
 
-@router.post("/target/{code}/score", summary="立即计算指数/组合评分")
+@router.post("/target/{code}/score", summary="立即重算评分（删旧 + 全量重算）")
 def target_score(code: str, _: None = Depends(deps.require_auth)):
-    """按目标类型算评分：指数→index_score，组合→portfolio_score。"""
+    """立即重算该标的的评分：**先删掉已有分位/评分，再整条重建 + 重算当日**。
+
+    三种类型都支持（index / portfolio / stock）。以前这里只有两个分支 ——
+    portfolio 走 portfolio_score、**其余（含个股）都走 index_score**，
+    而 index_score 第一件事是读成分股，个股没有成分股 → 返回 None →
+    前端报"成分股无可用的估值数据"。而且它只 upsert 当日一条，既不删旧数据、
+    也不重建历史，和按钮名/用户预期都不符。
+    """
     t = config.target(code)
     if not t:
         raise HTTPException(status_code=404, detail=f"目标不存在：{code}")
     conn = deps.conn()
     try:
-        if t["ktype"] == "portfolio":
-            r = indicators.portfolio_score(conn, code)
-        else:
-            r = indicators.index_score(conn, code)
+        r = indicators.rebuild_scores(conn, code, t["ktype"])
     finally:
         conn.close()
-    if not r:
+    if not r or (r.get("score") is None and not r.get("history_rows")):
         raise HTTPException(status_code=400,
-                            detail="评分失败：成分股无可用的估值数据（先拉取数据）")
+                            detail="评分失败：该标的无可用的估值数据（先拉取数据）")
     return r
 
 
