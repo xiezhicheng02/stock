@@ -1,49 +1,53 @@
-# ============================================================
-# 依赖清单（最小闭包；不含 akshare —— 数据源已全部换成 baostock）
-#
-# 安装：
-#   pip install -r requirements.txt
-#
-# 树莓派上用 piwheels 加速（ARM 预编译包，省去现场编译）：
-#   pip install -r requirements.txt \
-#       -i https://www.piwheels.org/simple \
-#       --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
-#
-# 版本为已验证可用的组合（Python 3.12）。若将来升级，请整体升级后重跑一次出图验证。
-# ============================================================
-
-# ---------- 数据源 ----------
-baostock==0.9.3
-pandas==3.0.5               # baostock 内部依赖
-
-# ---------- 计算与绘图 ----------
-numpy==2.5.3
-matplotlib==3.11.1
-pillow==12.3.0             # matplotlib 输出 PNG 用
-contourpy==1.3.3
-cycler==0.12.1
-fonttools==4.64.0
-kiwisolver==1.5.1
-pyparsing==3.3.2
-python-dateutil==2.9.0.post0
-six==1.17.0
-packaging==26.3
-
-# ---------- Web 服务 ----------
-fastapi==0.141.1
-uvicorn==0.52.4            # 刻意不装 [standard]：避免 uvloop/httptools 在 32 位 ARM 上现场编译
-starlette==1.6.0
-pydantic==2.13.5
-pydantic_core==2.46.5
+akracer==0.0.14
+akshare==1.18.94
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
-h11==0.16.0
+APScheduler==3.11.3
+baostock==0.9.3
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
 click==8.5.0
+contourpy==1.3.3
+curl_cffi==0.16.3
+cycler==0.12.1
+decorator==5.3.1
+et_xmlfile==2.0.0
+fastapi==0.141.1
+fonttools==4.64.0
+greenlet==3.5.5
+h11==0.16.0
+html5lib==1.1
 idna==3.19
+jsonpath==0.82.2
+kiwisolver==1.5.1
+lxml==6.1.3
+matplotlib==3.11.1
+numpy==2.5.3
+openpyxl==3.1.5
+packaging==26.3
+pandas==3.0.5
+pillow==12.3.0
+playwright==1.62.0
+py-mini-racer==0.6.0
+pycparser==3.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+pyee==13.0.1
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+requests==2.34.2
+six==1.17.0
+soupsieve==2.9.2
+starlette==1.6.0
+tabulate==0.10.0
+tqdm==4.70.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
-
-# ---------- 定时任务 ----------
-APScheduler==3.11.3
 tzlocal==5.4.4
+urllib3==2.7.0
+uvicorn==0.52.4
+webencodings==0.6.1
+xlrd==2.0.2
