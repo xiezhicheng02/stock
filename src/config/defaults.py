@@ -104,8 +104,9 @@ DEFAULT_SETTINGS = [
      "uvicorn 日志级别: critical/error/warning/info/debug（需重启服务生效）"),
     ("WEB_RELOAD", False, "bool", "web",
      "代码热重载（开发用；需安装 watchfiles，不可与调度器共存。需重启服务生效）"),
-    ("WEB_PAGE_REFRESH_SEC", 30, "int", "web",
-     "网页顶栏状态自动刷新间隔(秒)，0=不自动刷新（刷新页面即生效）"),
+    ("WEB_HEALTH_REFRESH_SEC", 300, "int", "web",
+     "顶栏健康检查(/api/health)的自动刷新间隔(秒)，0=只在打开页面时查一次。"
+     "它只决定顶栏那行状态文字多久更新，5 分钟足够"),
     ("WEB_STATS_CACHE_SEC", 60, "int", "web",
      "首页统计缓存秒数：首页几个统计查询很贵（树莓派上每次数秒），缓存后"
      "30 秒一次的自动刷新几乎不花代价。0=不缓存"),
@@ -121,7 +122,7 @@ DEFAULT_SETTINGS = [
         {"title": "🛒 推荐操作与配色", "keys": ["ACTION_SHORT", "ACTION_ICON", "STATUS_STYLE"]},
         {"title": "📥 数据源（baostock）", "keys": ["BAOSTOCK_START_DATE", "BAOSTOCK_RETRY", "BAOSTOCK_TIMEOUT", "FETCH_SLEEP", "FETCH_BATCH_LOG", "DIVIDEND_LOOKBACK_DAYS", "DIVIDEND_YEARS_BACK", "REBUILD_WORKERS", "SYNC_BEFORE_SCORE"]},
         {"title": "📈 图表与权重", "keys": ["HISTORY_YEARS_10Y", "HISTORY_YEARS_5Y", "HISTORY_YEARS_CHART", "COMPOSITE_WEIGHTS"]},
-        {"title": "⚙️ 系统", "keys": ["WEB_HOST", "WEB_PORT", "WEB_LOG_LEVEL", "WEB_RELOAD", "WEB_PAGE_REFRESH_SEC", "WEB_STATS_CACHE_SEC", "WEB_AUTH_TOKEN", "PREVIEW_DIR"]},
+        {"title": "⚙️ 系统", "keys": ["WEB_HOST", "WEB_PORT", "WEB_LOG_LEVEL", "WEB_RELOAD", "WEB_HEALTH_REFRESH_SEC", "WEB_STATS_CACHE_SEC", "WEB_AUTH_TOKEN", "PREVIEW_DIR"]},
     ], "json", "web", "配置分组及展示顺序（title=节标题, keys=该节配置键，程序自动维护）"),
     ("PREVIEW_DIR", "logs/preview", "str", "web", "邮件预览 HTML 输出目录（web 端生成）"),
 
@@ -196,6 +197,7 @@ def smtp_source_note() -> str:
 #   写入，留着只是占用；复权方式固定为代码常量（见 data_fetcher 的 ADJUST_KLINE /
 #   ADJUST_RAW），设置页不暴露，因此已删除这条墓碑。
 DEPRECATED_SETTINGS = (
+    "WEB_PAGE_REFRESH_SEC",  # 正名为 WEB_HEALTH_REFRESH_SEC（它其实只管顶栏健康检查）
     "RUN_WEEKDAYS",          # 由 baostock 股市日历替代（见 SKIP_NON_TRADING_DAY）
     "MAIN_RUN_HOUR",
     "MAIN_RUN_MINUTE",

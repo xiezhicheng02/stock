@@ -575,7 +575,7 @@ def ui_meta():
         "alert_prefix": get_str("ALERT_PREFIX", ""),
         "divergence_threshold": get_int("DIVERGENCE_THRESHOLD", 15),
         "windows": windows(),
-        "page_refresh": get_int("WEB_PAGE_REFRESH_SEC", 30),
+        "health_refresh": get_int("WEB_HEALTH_REFRESH_SEC", 300),
     }
 
 
@@ -619,7 +619,7 @@ def web():
         "port": get_int("WEB_PORT", 8000),
         "log_level": get_str("WEB_LOG_LEVEL", "info"),
         "reload": get_bool("WEB_RELOAD", False),
-        "page_refresh": get_int("WEB_PAGE_REFRESH_SEC", 30),
+        "health_refresh": get_int("WEB_HEALTH_REFRESH_SEC", 300),
         "preview_dir": get_str("PREVIEW_DIR", "logs/preview"),
     }
 

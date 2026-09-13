@@ -48,13 +48,14 @@ async function refreshHeader() {
     // 状态/配色会退回出厂默认值，必须明确告诉用户，否则会被误当成"状态全变未知"
     setStickyWarn(META.loaded ? '' : ('后端未返回展示配置（/api/health 无 meta 字段）：'
       + '估值区间与配色暂按出厂默认值显示。请重启服务后刷新页面。'));
-    scheduleHeaderRefresh(META.pageRefresh);
+    scheduleHeaderRefresh(META.healthRefresh);
   } catch (e) {
     showBanner(e.message);
   }
 }
 
-// 顶栏刷新定时器：间隔由 WEB_PAGE_REFRESH_SEC 决定，0 = 不自动刷新。
+// 顶栏健康检查定时器：间隔由 WEB_HEALTH_REFRESH_SEC 决定（默认 300 秒），0 = 只查一次。
+// 它只更新顶栏那行状态文字，没必要查得太勤。
 // 每次刷新后按最新配置重排，所以改完设置不用重启服务。
 let headerTimer = null;
 function scheduleHeaderRefresh(sec) {

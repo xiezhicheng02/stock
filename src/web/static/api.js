@@ -254,7 +254,7 @@ const META = {
   loaded: false,       // /api/health 是否成功带回 meta（false = 用的出厂兜底值）
   chartYears: 5,       // HISTORY_YEARS_CHART：K 线/分位走势窗口
   mainYears: 10,       // HISTORY_YEARS_10Y：评分走势窗口
-  pageRefresh: 30,     // WEB_PAGE_REFRESH_SEC：顶栏刷新间隔(秒)，0=不刷新
+  healthRefresh: 300,  // WEB_HEALTH_REFRESH_SEC：顶栏健康检查间隔(秒)，0=只查一次
   actionShort: DEFAULT_ACTION_SHORT,    // ACTION_SHORT：状态 → 短动作词
   actionIcon: DEFAULT_ACTION_ICON,      // ACTION_ICON：状态 → 图标
   alertStatuses: DEFAULT_ALERT_STATUSES, // ALERT_STATUSES：进入告警态的状态
@@ -281,7 +281,9 @@ function applyMeta(meta) {
   const w = meta.windows || {};
   if (w.chart > 0) META.chartYears = w.chart;
   if (w.main > 0) META.mainYears = w.main;
-  META.pageRefresh = meta.page_refresh != null ? meta.page_refresh : 30;
+  // 兼容旧后端字段名 page_refresh（缓存里的旧响应），取不到就用 300
+  const hr = meta.health_refresh != null ? meta.health_refresh : meta.page_refresh;
+  META.healthRefresh = hr != null ? hr : 300;
   META.actionShort = meta.action_short || {};
   META.actionIcon = meta.action_icon || {};
   META.alertStatuses = meta.alert_statuses || [];
