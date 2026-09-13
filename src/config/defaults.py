@@ -106,6 +106,9 @@ DEFAULT_SETTINGS = [
      "代码热重载（开发用；需安装 watchfiles，不可与调度器共存。需重启服务生效）"),
     ("WEB_PAGE_REFRESH_SEC", 30, "int", "web",
      "网页顶栏状态自动刷新间隔(秒)，0=不自动刷新（刷新页面即生效）"),
+    ("WEB_STATS_CACHE_SEC", 60, "int", "web",
+     "首页统计缓存秒数：首页几个统计查询很贵（树莓派上每次数秒），缓存后"
+     "30 秒一次的自动刷新几乎不花代价。0=不缓存"),
     ("WEB_AUTH_TOKEN", "", "str", "web",
      "接口访问令牌（留空=不校验；局域网暴露在 0.0.0.0 时建议设置一个）"),
     ("SETTING_GROUPS", [
@@ -118,7 +121,7 @@ DEFAULT_SETTINGS = [
         {"title": "🛒 推荐操作与配色", "keys": ["ACTION_SHORT", "ACTION_ICON", "STATUS_STYLE"]},
         {"title": "📥 数据源（baostock）", "keys": ["BAOSTOCK_START_DATE", "BAOSTOCK_RETRY", "BAOSTOCK_TIMEOUT", "FETCH_SLEEP", "FETCH_BATCH_LOG", "DIVIDEND_LOOKBACK_DAYS", "DIVIDEND_YEARS_BACK", "REBUILD_WORKERS", "SYNC_BEFORE_SCORE"]},
         {"title": "📈 图表与权重", "keys": ["HISTORY_YEARS_10Y", "HISTORY_YEARS_5Y", "HISTORY_YEARS_CHART", "COMPOSITE_WEIGHTS"]},
-        {"title": "⚙️ 系统", "keys": ["WEB_HOST", "WEB_PORT", "WEB_LOG_LEVEL", "WEB_RELOAD", "WEB_PAGE_REFRESH_SEC", "WEB_AUTH_TOKEN", "PREVIEW_DIR"]},
+        {"title": "⚙️ 系统", "keys": ["WEB_HOST", "WEB_PORT", "WEB_LOG_LEVEL", "WEB_RELOAD", "WEB_PAGE_REFRESH_SEC", "WEB_STATS_CACHE_SEC", "WEB_AUTH_TOKEN", "PREVIEW_DIR"]},
     ], "json", "web", "配置分组及展示顺序（title=节标题, keys=该节配置键，程序自动维护）"),
     ("PREVIEW_DIR", "logs/preview", "str", "web", "邮件预览 HTML 输出目录（web 端生成）"),
 

@@ -355,6 +355,20 @@ def delete(key):
 # =====================================================================
 # 估值目标（valuation_target 表）
 # =====================================================================
+def _target_row(r) -> dict:
+    """valuation_target 的一行 → 目标字典（targets/target 共用，形状只定义一处）。"""
+    return {
+        "code": r["code"], "name": r["name"], "ktype": r["ktype"],
+        "enabled": bool(r["enabled"]), "sort_order": r["sort_order"],
+        "remark": r["remark"],
+        "weights": {
+            "pe": r["w_pe"] or 0.0, "pb": r["w_pb"] or 0.0,
+            "ps": r["w_ps"] or 0.0, "pcf": r["w_pcf"] or 0.0,
+            "dividend": r["w_dividend"] or 0.0,
+        },
+    }
+
+
 def targets(only_enabled=True, ktype=None):
     """读取需要计算综合估值的指数/个股及其权重。
 
@@ -372,27 +386,20 @@ def targets(only_enabled=True, ktype=None):
     sql += " ORDER BY sort_order, code"
     with closing(_connect()) as conn:
         rows = conn.execute(sql, params).fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "code": r["code"], "name": r["name"], "ktype": r["ktype"],
-            "enabled": bool(r["enabled"]), "sort_order": r["sort_order"],
-            "remark": r["remark"],
-            "weights": {
-                "pe": r["w_pe"] or 0.0, "pb": r["w_pb"] or 0.0,
-                "ps": r["w_ps"] or 0.0, "pcf": r["w_pcf"] or 0.0,
-                "dividend": r["w_dividend"] or 0.0,
-            },
-        })
-    return out
+    return [_target_row(r) for r in rows]
 
 
 def target(code):
-    """按代码取单个估值目标；不存在返回 None。"""
-    for t in targets(only_enabled=False):
-        if t["code"] == code:
-            return t
-    return None
+    """按代码取单个估值目标；不存在返回 None。
+
+    **直接走主键查**（`valuation_target.code` 是主键），不要遍历 targets() ——
+    后者是整表读取。调用方只要逐只循环，就是 N 次全表读：首页告警卡片曾经循环
+    856 个代码、每次都调这里，实测本机 525ms、树莓派上约 3~5s。
+    """
+    with closing(_connect()) as conn:
+        r = conn.execute("SELECT * FROM valuation_target WHERE code=?",
+                         (code,)).fetchone()
+    return _target_row(r) if r else None
 
 
 def weights_of(code):

@@ -5,6 +5,7 @@
 """
 
 import logging
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,6 +22,10 @@ router = APIRouter(prefix="/api", tags=["dashboard"])
 
 MARKET_INDEX = "sh.000001"          # 上证指数（仅行情展示，不估值）
 MARKET_INDEX_NAME = "上证指数"
+
+#: 首页统计的进程内短缓存 {key: (过期时间戳, 值)}。
+#: 单进程（调度器与 web 同进程、固定单 worker），所以进程内缓存就够。
+_CACHE: dict = {}
 
 
 def _trend(closes):
@@ -51,14 +56,32 @@ def _market(conn) -> dict:
 
 
 def _stats(conn) -> dict:
-    """数据统计总览。"""
+    """数据统计总览（**带短缓存**）。
+
+    这里三个查询都是"全表统计"：`COUNT(DISTINCT code)` 扫 316 万行、
+    两个 `GROUP BY code` 各扫 300 万行左右，本机合计 ~1.9s、树莓派上 10 秒以上。
+    而它们的结果只在**拉取/计算任务写库**时才变 —— 首页却每 30 秒自动刷新一次，
+    等于拿最贵的查询去喂最高频的刷新。
+
+    所以按 `(data_fingerprint, WEB_STATS_CACHE_SEC)` 做进程内缓存：
+      * 指纹变了（取数任务写过库）→ 立即失效，不用等 TTL；
+      * TTL 兜住"计算任务写的"变化（评分/分位，指纹反映不出来）。
+    设 WEB_STATS_CACHE_SEC=0 可关闭缓存。
+    """
+    ttl = max(0, config.get_int("WEB_STATS_CACHE_SEC", 60))
+    key = ("stats", storage.data_fingerprint(conn), ttl)
+    if ttl:
+        now = time.time()
+        hit = _CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
     targets = config.targets(only_enabled=False)
     n_index = sum(1 for t in targets if t["ktype"] == "index")
     n_pf = sum(1 for t in targets if t["ktype"] == "portfolio")
     kd = storage.latest_kline_dates(conn)
     sd = storage.latest_score_dates(conn)
     lo, hi = storage.trade_date_range(conn)
-    return {
+    out = {
         "stocks": storage.count_stocks(conn),
         "indexes": n_index,
         "portfolios": n_pf,
@@ -67,26 +90,34 @@ def _stats(conn) -> dict:
         "trade_calendar": {"start": lo, "end": hi},
         "last_run_at": config.get_str("LAST_RUN_AT", "") or None,
     }
+    if ttl:
+        _CACHE[key] = (time.time() + ttl, out)
+        # 顺手清掉过期项，避免 key 里带指纹导致无限增长
+        for k, v in list(_CACHE.items()):
+            if v[0] < time.time():
+                _CACHE.pop(k, None)
+    return out
 
 
 def _alert(conn) -> dict:
     """告警状态：当前处于告警态的标的 + 最近告警时间。
 
+    只遍历**标的信息里的标的**：只有它们才有 `score`（其余 260 万行 score 为空、
+    只落分位），遍历全部 860 个代码纯属白跑 —— 还会顺带调 860 次 `config.target()`。
+    实测这一步原来要 ~1.3s（本机）。
+
     告警状态按**当前配置**实时推导（config.signal_of），不读 valuation_score
     里的 status 快照——否则改了 SIGNAL_BANDS / ALERT_STATUSES 要等全量重算才生效。
     """
-    latest = storage.latest_score_dates(conn)
     alert_targets = []
-    for code in sorted(latest):
-        sc = storage.latest_score(conn, code)
-        if not sc:
+    for t in config.targets(only_enabled=False):
+        sc = storage.latest_score(conn, t["code"])
+        if not sc or sc.get("score") is None:
             continue
-        sig = config.signal_of(sc.get("score"))
+        sig = config.signal_of(sc["score"])
         if not sig["alert"]:
             continue
-        t = config.target(code)
-        alert_targets.append({"code": code,
-                              "name": t["name"] if t else code,
+        alert_targets.append({"code": t["code"], "name": t["name"],
                               "status": sig["status"], "score": sc["score"],
                               "color": sig["color"],
                               "action": sig["short"] or sig["action"],
