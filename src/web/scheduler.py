@@ -68,8 +68,13 @@ def _build_trigger(spec: dict):
     raise ValueError(f"不支持的触发器类型：{kind}（只支持 interval / cron）")
 
 
-def _trigger_text(trigger) -> str:
-    """触发器的中文可读描述（供页面展示）。"""
+def _trigger_text(trigger, trading_day_only: bool = True) -> str:
+    """触发器的中文可读描述（供页面展示）。
+
+    trading_day_only=False 时不加"（仅交易日执行）"后缀 —— 例如「计算指标」
+    是纯离线补算任务，任何一天都会跑，标成"仅交易日"会与实际行为不符。
+    """
+    suffix = "（仅交易日执行）" if trading_day_only else ""
     if isinstance(trigger, IntervalTrigger):
         total = int(trigger.interval.total_seconds())
         if total % 3600 == 0:
@@ -91,9 +96,18 @@ def _trigger_text(trigger) -> str:
                 except (ValueError, TypeError):
                     return s
             every = "*" in str(dow) or str(dow) == "0-6"
-            time_txt = f"{_pad(hour)}:{_pad(minute)}"
+            h_str, m_str = str(hour), str(minute)
+            # 按间隔跑的（小时不限、分钟是列表）：例如计算指标落在每小时的 05/35 分
+            if "*" in h_str and any(c in m_str for c in ",-/"):
+                mins = "、".join(_pad(x) for x in m_str.split(","))
+                return (f"每小时的 {mins} 分{suffix}" if every
+                        else f"每周 {dow} 的 {mins} 分")
+            if "*" in h_str:
+                return (f"每小时第 {_pad(m_str)} 分{suffix}" if every
+                        else f"每周 {dow} 第 {_pad(m_str)} 分")
+            time_txt = f"{_pad(h_str)}:{_pad(m_str)}"
             # 触发器本身就是每天；是否真跑由交易日历在任务里判断
-            return f"每天 {time_txt}（仅交易日执行）" if every else f"每周 {dow} {time_txt}"
+            return f"每天 {time_txt}{suffix}" if every else f"每周 {dow} {time_txt}"
         except (IndexError, AttributeError):
             pass
     return str(trigger)
@@ -108,11 +122,19 @@ def recent(limit: int = 20) -> list[dict]:
     return _recent[:limit]
 
 
-def _remember(job_id: str, ok: bool, msg: str):
-    """记一次执行结果：内存缓冲 + 配置表持久化。"""
+def _remember(job_id: str, ok: bool, msg: str, set_last: bool = True):
+    """记一次执行结果：内存缓冲 + 配置表持久化。
+
+    set_last=False 用于"这次根本没执行"的事件（被 max_instances 挡掉、错过触发）：
+    它们只进"最近执行记录"列表，**不覆盖**该任务的"最近一次执行结果"。
+    否则会出现"任务明明跑完了，界面上却显示失败"——例如 20:00 的 data_sync 还在跑，
+    20:21 有人手动点了一次被挡掉，那条"跳过"就把成功的记录顶掉了。
+    """
     item = {"job_id": job_id, "at": _now_text(), "ok": ok, "msg": msg}
     _recent.insert(0, item)
     del _recent[_RECENT_MAX:]
+    if not set_last:
+        return
     try:
         # 用 update_json 做原子的读-改-写：线程池里多个任务的完成事件会并发写这个键，
         # 直接 get+set 会互相覆盖（某个任务的执行结果会凭空消失）
@@ -138,10 +160,15 @@ def _on_event(event):
         log.exception("任务 %s 执行失败", job_id,
                       exc_info=getattr(event, "exception", None))
     elif event.code == EVENT_JOB_MISSED:
-        _remember(job_id, False, "错过触发时间（进程未运行或任务过慢）")
+        # 没执行（进程没运行/任务过慢）：只进历史列表，不覆盖"最近一次执行结果"
+        _remember(job_id, False, "错过触发时间（进程未运行或任务过慢）",
+                  set_last=False)
         log.warning("任务 %s 错过触发时间", job_id)
     elif event.code == EVENT_JOB_MAX_INSTANCES:
-        _remember(job_id, False, "跳过：上一次还没跑完（max_instances 限制）")
+        # 被"上一次还没跑完"挡掉：这次根本没执行，
+        # 而且**上一次还在跑**，它跑完自然会写结果 —— 不能在这里覆盖
+        _remember(job_id, False, "跳过：上一次还没跑完（max_instances 限制）",
+                  set_last=False)
         log.warning("任务 %s 因上一次仍在运行被跳过", job_id)
 
 
@@ -365,7 +392,9 @@ def jobs_info() -> list[dict]:
                 "id": job.id,
                 "name": job.name,
                 "remark": spec.get("remark", ""),
-                "trigger": _trigger_text(job.trigger),
+                "trigger": _trigger_text(
+                    job.trigger,
+                    trading_day_only=job.id not in jobs_mod.NO_HOLIDAY_GUARD),
                 "next_run": nxt.strftime("%Y-%m-%d %H:%M:%S") if nxt else None,
                 "running": job.id in _running,
                 "running_since": _running.get(job.id),

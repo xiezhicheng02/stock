@@ -96,36 +96,18 @@ def sync_target(conn, code: str, ktype: str | None = None,
         out = {"ok": True, "code": code, "ktype": ktype,
                "started_at": t0.strftime("%Y-%m-%d %H:%M:%S")}
 
-        # ① 交易日历（离线判断"最新"的基准；缺失时先补）
-        if not storage.latest_trade_date(conn, datetime.now().strftime("%Y-%m-%d")):
+        # ---------- ① 取数（联网；只取数，不算）----------
+        with data_fetcher.BaostockSession() as sess:
+            # 交易日历缺失时先补（离线判断"最新"的基准）
             try:
-                with data_fetcher.BaostockSession() as s:
-                    data_fetcher.sync_trade_dates(conn, s, full=False)
-                out["trade_calendar"] = "synced"
+                if data_fetcher.ensure_trade_calendar(conn, sess):
+                    out["trade_calendar"] = "synced"
             except Exception as e:                          # noqa: BLE001
                 log.warning("交易日历同步失败，改用成分股已有数据判断：%s", e)
+            out["sync"] = data_fetcher.sync_target_data(conn, sess, code, ktype, full)
 
-        # ② 取数
-        with data_fetcher.BaostockSession() as sess:
-            if ktype == "index":
-                out["sync"] = data_fetcher.sync_index(conn, sess, code, full)
-                indicators.fill_dividend_yields(
-                    conn, storage.load_constituents(conn, code))
-                indicators.rebuild_index_valuation(conn, code, only_missing=not full)
-                indicators.index_score(conn, code)
-            elif ktype == "portfolio":
-                out["sync"] = data_fetcher.sync_portfolio(conn, sess, code, full)
-                indicators.fill_dividend_yields(
-                    conn, storage.load_constituents(conn, code))
-                out["kline_synth"] = indicators.rebuild_portfolio_kline(conn, code)
-                indicators.portfolio_score(conn, code)
-            else:
-                # 元数据（名称/行业/上市日期）也要拉：新加入组合的个股以前只拉了
-                # K线+分红，页面上名称/行业是空的
-                data_fetcher.sync_stock_meta(conn, sess, code)
-                out["sync"] = data_fetcher.sync_stock(conn, sess, code, full)
-                indicators.fill_dividend_yield(conn, code)
-                indicators.stock_score(conn, code)
+        # ---------- ② 计算（纯离线；不联网）----------
+        out.update(indicators.compute_target(conn, code, ktype, full=full))
 
         out["elapsed"] = round((datetime.now() - t0).total_seconds(), 1)
         log.info("目标 %s（%s）同步完成：%s | 耗时 %.1fs",
@@ -173,12 +155,18 @@ def sync_data(conn, wait: bool = False) -> dict:
 # =====================================================================
 # 定时任务二：计算指标（compute_indicators，纯离线）
 # =====================================================================
-def compute_indicators(conn, wait: bool = False) -> dict:
-    """计算指标定时任务：补股息率 → 指数估值聚合 → 组合K线合成 → 评分（全落库）。
+def compute_indicators(conn, wait: bool = False, force: bool = False) -> dict:
+    """计算指标定时任务：检查所有个股/指数/组合的分位，缺什么补什么（分阶段+并发）。
 
-    纯离线计算（读 close_raw + dividend + kline），不联网、不占 baostock 会话，
+    纯离线计算（读 kline + dividend），不联网、不占 baostock 会话，
     因此可与拉取数据并发——拉取数据逐只写 K 线的过程中，这里每 30 分钟补一次
     已经落库的数据；被拉取数据重写而清空的股息率，会在下一轮补回来（幂等）。
+
+    **数据没变就早退**：取数侧没写过东西（`sync_state` 指纹没变），而且上一轮
+    跑完是干净的（没留下待办），就直接返回，省掉一天里几十次空转。
+    `force=True`（手动点「执行」）时不做这个判断 —— 手动触发就是要真跑一次。
+
+    实际阶段划分在 indicators.compute_all 里（个股并发 → 组合K线 → 指数/组合聚合）。
     """
     t0 = datetime.now()
     got = _COMPUTE_LOCK.acquire(blocking=wait)
@@ -186,21 +174,38 @@ def compute_indicators(conn, wait: bool = False) -> dict:
         return {"ok": False, "busy": True, "message": "上一次计算指标仍在进行，跳过"}
     try:
         out = {"ok": True, "started_at": t0.strftime("%Y-%m-%d %H:%M:%S")}
+        if not force:
+            fp = storage.data_fingerprint(conn)
+            if fp and storage.get_compute_fingerprint(conn) == fp:
+                log.info("数据未变化（指纹 %s），跳过本轮重算", fp)
+                return {"ok": True, "skipped": True, "fingerprint": fp,
+                        "reason": "数据未变化，跳过重算", "elapsed": 0.0}
         try:
             r = indicators.compute_all(conn, save_score=True)
-            out["dividend_yield_filled"] = r["dividend_yield_filled"]
-            out["scored"] = len(r["scored"])
-            out["scored_names"] = [x["name"] for x in r["scored"]]
-            out["percentiles"] = r.get("percentiles", 0)
+            for k, v in r.items():
+                if k not in ("ok", "started_at"):
+                    out[k] = v
+            # 只有在"确实没留下待办"时才记指纹，否则下一轮必须继续做：
+            # 记早了会把没补完的缺口一起跳过。
+            if not out.get("lagging") and not storage.dirty_codes(conn):
+                storage.set_compute_fingerprint(conn, out.get("fingerprint") or "")
+            else:
+                log.info("本轮仍留下待办（残缺 %s 只），不记指纹，下一轮继续",
+                         out.get("lagging"))
         except Exception as e:                      # noqa: BLE001
             log.exception("计算指标失败：%s", e)
             out["ok"] = False
             out["error"] = str(e)
         out["elapsed"] = round((datetime.now() - t0).total_seconds(), 1)
-        log.info("compute_indicators 完成：补股息率 %d 行，评分 %d 个标的，"
-                 "补分位 %d 个标的，耗时 %.1fs",
-                 out.get("dividend_yield_filled", 0), out.get("scored", 0),
-                 out.get("percentiles", 0), out["elapsed"])
+        log.info("compute_indicators 完成：补股息率 %d 行，补历史分位 %d 只个股"
+                 "（%d 行）+ %d 个组合，聚合 %d/%d，补最新分位 %d 个，"
+                 "仍残缺 %d 只，耗时 %.1fs",
+                 out.get("dividend_yield_filled", 0),
+                 out.get("history_stocks", 0), out.get("history_stock_rows", 0),
+                 out.get("history_agg", 0),
+                 out.get("agg_ok", 0), out.get("agg_total", 0),
+                 out.get("percentiles", 0), out.get("lagging", 0),
+                 out["elapsed"])
         return out
     finally:
         _COMPUTE_LOCK.release()
@@ -271,40 +276,25 @@ def rebuild_percentiles(conn, freq: str = "D", clean: bool = True,
 # 定时任务二：通知（构建 → 发送 → 重发）
 # =====================================================================
 def build_notification(conn, force: bool = False) -> dict:
-    """03:00：先补算标的信息，再读库中评分生成并暂存邮件正文（不发送）。
+    """读库中**已算好的**评分，生成并暂存邮件正文（不发送，也不计算）。
 
-    force=True（手动点「执行」）时跳过"非交易日不构建"的保护，
-    并强制执行一次标的信息补算 —— 手动触发是明确意图，不该被日历挡掉。
+    交易日守卫**不在这里**：统一放在 `web/jobs.py`（与其它任务一致），
+    这样"哪个任务什么时候跳过"只有一处判断。`force` 仅用于日志/兼容。
 
-    定时执行时 SKIP_NON_TRADING_DAY=True 且当天非交易日则直接跳过。
+    通知任务不做任何计算 —— 股息率/指数估值/组合K线/评分都由「计算指标」任务负责。
     """
     # 先清理过期正文，防止磁盘占满
     days = int(config.schedule()["mail_retention_days"])
     purged = storage.purge_old_pending(conn, days)
     purged += storage.purge_old_mail_body(conn, days)
 
-    if not force and config.get_bool("SKIP_NON_TRADING_DAY", True):
-        if is_trading_day(conn) is False:
-            log.info("今天不是交易日，跳过通知构建")
-            return {"ok": False, "reason": "今天不是交易日，跳过构建（手动执行可强制）",
-                    "purged": purged}
-
-    # 先把标的信息补算到最新（股息率/指数估值/组合K线/综合评分），
-    # 保证这次生成的邮件和库里的数据一致；补算本身是幂等的，没事时几乎不耗时。
-    computed, compute_busy = None, False
-    cr = compute_indicators(conn, wait=False)
-    if cr.get("busy"):
-        compute_busy = True
-        log.info("补算正忙，本次用现有数据生成邮件正文")
-    elif cr.get("ok"):
-        computed = cr
-    else:
-        log.warning("生成邮件前的补算失败（继续用现有数据）：%s", cr.get("error"))
-
+    # 这里**不做计算**：股息率/指数估值/组合K线/评分全部由「计算指标」任务
+    # （每 INDICATORS_INTERVAL_MINUTES 跑一次）负责，通知任务只读库渲染。
+    # 职责边界：取数(data_fetcher) / 计算(indicators) / 通知(本模块) 三层各管一段。
     rep = report.build_report(conn)
     if rep.get("empty"):
         return {"ok": False, "reason": "无评分数据，跳过通知构建",
-                "purged": purged, "computed": computed, "compute_busy": compute_busy}
+                "purged": purged}
     build_date = datetime.now().strftime("%Y-%m-%d")
     summary = _mail_summary(rep["items"])
     receivers = config.smtp()["receivers"]
@@ -320,8 +310,7 @@ def build_notification(conn, force: bool = False) -> dict:
     log.info("通知正文已暂存：%s（告警=%s，清理过期 %d 封）",
              rep["subject"], rep["has_alert"], purged)
     return {"ok": True, "subject": rep["subject"], "is_alert": rep["has_alert"],
-            "items": len(rep["items"]), "purged": purged,
-            "computed": computed, "compute_busy": compute_busy}
+            "items": len(rep["items"]), "purged": purged}
 
 
 def send_notification(conn) -> dict:
@@ -363,25 +352,12 @@ def resend_alert(conn) -> dict:
 
 
 
-def _meta_missing(conn, code: str) -> bool:
-    """这只标的的元数据是否缺失（缺名称/行业/上市日期任一项就算缺）。
-
-    元数据只在"缺"的时候才去 baostock 补 —— 成分股有几十只时，
-    每次重算都全量查一遍是白跑（一次网络往返/只），没必要。
-    """
-    rows = storage.load_stock_basic(conn, code=code)
-    if not rows:
-        return True
-    b = rows[0]
-    return not (b.get("name") and b.get("industry") and b.get("listed_date"))
-
-
 def ensure_constituent_data(conn, codes, wait: bool = False) -> dict:
     """把给定成分股的「K线 / 分红 / 元数据」补到最新（**只补缺的**）。
 
-    * K线+分红：只对"没有数据"或"落后于最近交易日"的标的拉；
-    * 元数据（名称/行业/上市日期）：只对**缺元数据的**标的拉，
-      已经齐全的跳过（成分股变动时新加进来的那几只才会被查）。
+    编排（取数与计算分层）：
+      ① 取数 —— data_fetcher.sync_constituents_data（联网，只补缺的）
+      ② 计算 —— 新拉回来的 K 线补动态股息率（indicators，纯离线）
 
     全程在 _RUN_LOCK 内，避免与「拉取数据」任务争用 baostock 会话。
     """
@@ -392,42 +368,15 @@ def ensure_constituent_data(conn, codes, wait: bool = False) -> dict:
     if not got:
         return {"busy": True, "checked": len(codes), "synced": [],
                 "meta": 0, "meta_checked": 0, "failed": []}
-    ref = storage.latest_trade_date(conn, datetime.now().strftime("%Y-%m-%d"))
-    stale, need_meta = [], []
-    for c in codes:
-        last = storage.latest_kline_date(conn, c)
-        if not last or (ref and last < ref):
-            stale.append(c)
-        if _meta_missing(conn, c):
-            need_meta.append(c)
-    synced, meta, failed = [], 0, []
     try:
-        with data_fetcher.BaostockSession() as sess:
-            for c in need_meta:
-                try:
-                    data_fetcher.sync_stock_meta(conn, sess, c)
-                    meta += 1
-                except Exception as e:              # noqa: BLE001
-                    log.warning("%s 元数据拉取失败：%s", c, e)
-                    failed.append(c)
-            for c in stale:
-                try:
-                    data_fetcher.sync_stock(conn, sess, c)
-                    synced.append(c)
-                except Exception as e:              # noqa: BLE001
-                    log.warning("%s 增量拉取失败：%s", c, e)
-                    failed.append(c)
-        # 新拉回来的 K 线要补动态股息率（离线计算）
-        if synced:
-            indicators.fill_dividend_yields(conn, synced)
+        info = data_fetcher.sync_constituents_data(conn, codes)
+        # 计算：新拉回来的 K 线要补动态股息率（离线）
+        if info.get("synced"):
+            indicators.fill_dividend_yields(conn, info["synced"])
     finally:
         _RUN_LOCK.release()
-    log.info("成分股数据检查：共 %d 只 | K线需补 %d（已补 %d）| "
-             "元数据缺 %d（已补 %d）| 失败 %d",
-             len(codes), len(stale), len(synced), len(need_meta), meta,
-             len(failed))
-    return {"checked": len(codes), "stale": len(stale), "synced": synced,
-            "meta": meta, "meta_checked": len(need_meta), "failed": failed}
+    info["busy"] = False
+    return info
 
 
 def rebuild_portfolio(conn, code: str, sync: bool = True,
@@ -502,12 +451,14 @@ def _run_locked(conn, sync, send, only_alerts, preview, codes, years,
     else:
         out["steps"]["sync"] = "skipped"
 
-    # ---------- ② 计算指标（补股息率 → 指数估值 → 组合K线 → 评分）----------
+    # ---------- ② 计算指标（个股并发补历史 → 组合K线 → 指数/组合聚合）----------
     r = indicators.compute_all(conn, save_score=True,
                                rebuild_valuation=rebuild_valuation)
-    results = r["scored"]
-    out["steps"]["score"] = f"{len(results)} 个标的"
-    if not results:
+    out["steps"]["score"] = (
+        f"补历史分位 {r.get('history_stocks', 0)} 只个股 + "
+        f"{r.get('history_agg', 0)} 个组合，聚合 {r.get('agg_ok', 0)}/"
+        f"{r.get('agg_total', 0)}")
+    if not r.get("agg_ok"):
         out["ok"] = False
         out["steps"]["score"] = "无可用标的（缺少成分股或K线数据）"
         log.error("没有任何标的完成评分，本次不发信")

@@ -109,47 +109,54 @@ def data_sync():
 
 
 def compute_indicators():
-    """计算指标（离线）：补股息率/指数估值/组合K线，再算综合评分。
+    """计算指标（离线）：检查库里哪些还没算出来，缺什么补什么。
 
-    非交易日没有新数据可补，同样按股市日历跳过；手动触发会强制跑。
+    **不判断交易日**：这是纯离线任务（只读库 → 算 → 写回，不联网），
+    "有没有没算的"本身就是完备判据 —— 交易日守卫在这里是多余的，反而会让
+    周末/假期积压的补算一直拖到下一个交易日。数据没变时数据闸门会在 0.3ms 内
+    早退，所以休市日跑也几乎不花代价。手动触发会绕过闸门强制真跑一次。
     """
-    if not _take_force("compute_indicators"):
-        why = _holiday_skip()
-        if why:
-            return why
+    force = _take_force("compute_indicators")
     conn = _conn()
     try:
-        r = pipeline.compute_indicators(conn)
+        # force=True 时不做"数据没变就早退"的判断：手动点执行就是要真跑一次
+        r = pipeline.compute_indicators(conn, force=force)
         if r.get("busy"):
             return "拉取数据进行中，跳过（下次重试）"
+        if r.get("skipped"):
+            return f"跳过重算：{r.get('reason')}"
         if not r["ok"]:
             raise RuntimeError(str(r))
         return (f"补股息率 {r.get('dividend_yield_filled', 0)} 行，"
-                f"评分 {r.get('scored', 0)} 个标的，耗时 {r.get('elapsed', 0)}s")
+                f"补历史分位 {r.get('history_stocks', 0)} 只个股 + "
+                f"{r.get('history_agg', 0)} 个组合，"
+                f"聚合 {r.get('agg_ok', 0)}/{r.get('agg_total', 0)}，"
+                f"耗时 {r.get('elapsed', 0)}s")
     finally:
         conn.close()
 
 
 def notify_build():
-    """03:00：先补算标的信息，再读评分生成并暂存邮件正文。
+    """03:00：读库里已算好的评分，生成并暂存邮件正文。
 
-    手动点「执行」时会带上 force 标记：跳过"非交易日不构建"的保护（周末也能
-    生成一份用于预览），并先把标的信息补算到最新，保证邮件内容和库里一致。
+    这里**不做任何计算**：股息率/指数估值/组合K线/评分都由「计算指标」任务
+    （每 INDICATORS_INTERVAL_MINUTES 跑一次）负责。手动点「执行」时会带上
+    force 标记，跳过"非交易日不构建"的保护（周末也能生成一份预览）。
+
+    交易日守卫和其它任务一样放在这里（而不是 pipeline 内部），
+    这样"哪个任务什么时候跳过"只有一处判断。
     """
     force = _take_force("notify_build")
+    if not force:
+        why = _holiday_skip()
+        if why:
+            return why
     conn = _conn()
     try:
         r = pipeline.build_notification(conn, force=force)
         if not r["ok"]:
             return f"跳过构建：{r.get('reason')}"
-        extra = ""
-        if r.get("computed"):
-            c = r["computed"]
-            extra = (f"（先补算：股息率 {c.get('dividend_yield_filled', 0)} 行，"
-                     f"评分 {c.get('scored', 0)} 个标的，{c.get('elapsed', 0)}s）")
-        elif r.get("compute_busy"):
-            extra = "（补算正忙，用现有数据生成）"
-        return f"构建：{r.get('subject', '')}{extra}"
+        return f"构建：{r.get('subject', '')}"
     finally:
         conn.close()
 
@@ -210,14 +217,26 @@ def _build_jobs() -> list[dict]:
         h, m = config._split_hhmm(hhmm)
         return {"type": "cron", "day_of_week": "*", "hour": h, "minute": m}
 
+    def interval_trigger(minutes):
+        """按间隔触发，但**用 cron 落在固定的分钟点上**（每小时第 5、5+N、…分）。
+
+        为什么不用 interval 触发器：interval 是**从进程启动时刻**起算的，
+        :00/:30 启动就会让计算任务正好撞上 03:00 的「构建正文」和 08:30 的
+        「发送邮件」，两个任务同时读写 valuation_score。改成固定分钟点后，
+        永远避开 :00/:30，也不会因为重启而漂移。
+        """
+        step = max(1, int(minutes or 30))
+        mins = list(range(5, 60, step)) or [5]
+        return {"type": "cron", "day_of_week": "*",
+                "minute": ",".join(str(m) for m in mins)}
+
     jobs = [
         {"id": "data_sync", "name": "拉取数据", "func": data_sync,
          "trigger": crontrigger(sc["sync_time"]),
          "remark": "拉K线(前复权+不复权收盘价)/成分股/分红，纯取数落库"},
         {"id": "compute_indicators", "name": "计算指标", "func": compute_indicators,
-         "trigger": {"type": "interval",
-                     "minutes": sc["indicators_interval_minutes"]},
-         "remark": "补算股息率/指数估值/组合K线 + 综合评分（离线，检查缺失即补）"},
+         "trigger": interval_trigger(sc["indicators_interval_minutes"]),
+         "remark": "检查库里哪些没算出来就补（离线，不判断交易日，每天按点跑）"},
         {"id": "notify_build", "name": "通知·构建正文", "func": notify_build,
          "trigger": crontrigger(sc["notify_build_time"]),
          "remark": "读评分，生成并暂存邮件正文"},
@@ -234,6 +253,11 @@ def _build_jobs() -> list[dict]:
 
 def JOBS():
     return _build_jobs()
+
+
+#: 这些任务**不做**交易日判断（纯离线、按需补算，任何一天都该跑）。
+#: 页面上的"（仅交易日执行）"后缀也据此决定，别让它和实际行为不一致。
+NO_HOLIDAY_GUARD = frozenset({"compute_indicators"})
 
 
 def registry() -> dict:

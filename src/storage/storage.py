@@ -120,21 +120,39 @@ KLINE_VALUE_FIELDS = (
     "div_yield", "is_st",
 )
 
+#: 重写 K 线时**必须保留**原值的列（新值为 NULL 时不覆盖）。
+#:
+#: close_raw 是不复权收盘价，取自另一路 baostock 查询，**不由 K 线数据推导**：
+#: 一旦被抹掉就再也算不回来（只能重新联网拉一次）。而 K 线重写（前复权历史修正、
+#: 新分红重拉）本来就不该动它 —— 所以这里用 COALESCE 保住。
+#:
+#: div_yield 故意**不**保留：它是由 close_raw + dividend 离线算出来的，
+#: 前复权历史被重写后旧值就失效了，必须置空让 fill_dividend_yields 重算。
+_KLINE_KEEP_ON_REWRITE = ("close_raw",)
+
 _INSERT_KLINE_SQL = (
-    "INSERT OR REPLACE INTO kline"
-    "(code,date,ktype," + ",".join(KLINE_VALUE_FIELDS) + ") "
-    "VALUES(" + ",".join(["?"] * (3 + len(KLINE_VALUE_FIELDS))) + ")"
+    "INSERT INTO kline(code,date,ktype," + ",".join(KLINE_VALUE_FIELDS) + ") "
+    "VALUES(" + ",".join(["?"] * (3 + len(KLINE_VALUE_FIELDS))) + ") "
+    "ON CONFLICT(code,date) DO UPDATE SET "
+    + ",".join(
+        (f"{f}=COALESCE(excluded.{f},kline.{f})" if f in _KLINE_KEEP_ON_REWRITE
+         else f"{f}=excluded.{f}")
+        for f in KLINE_VALUE_FIELDS)
 )
 
 
 def upsert_kline(conn, code: str, ktype: str, rows, batch: int = 2000) -> int:
-    """批量写入 K 线（INSERT OR REPLACE）。
+    """批量写入 K 线（UPSERT；重写时保留 close_raw，见 _KLINE_KEEP_ON_REWRITE）。
 
     code   标的代码，如 sh.600000 / sh.000300
     ktype  'stock' 或 'index'
     rows   [{字段: 值}]，须含 date；其余字段缺失按 None 处理
     batch  每多少行提交一次（大历史数据避免单次事务过大）
     返回写入行数
+
+    这里**不能**用 INSERT OR REPLACE：那是"先 DELETE 再 INSERT"，
+    没出现在 rows 里的列（例如取数阶段才写的 close_raw）会被一起抹成 NULL。
+    曾经就是因为这个 + 后续回补失败，导致 212 只个股的 close_raw 整条丢失。
     """
     payload = []
     for r in rows:
@@ -270,9 +288,13 @@ def update_close_raw(conn, code: str, rows, batch: int = 2000) -> int:
     sql = "UPDATE kline SET close_raw=? WHERE code=? AND date=?"
     total = 0
     for i in range(0, len(payload), batch):
+        before = conn.total_changes
         conn.executemany(sql, payload[i:i + batch])
         conn.commit()
-        total += len(payload[i:i + batch])
+        # 返回**真实更新行数**（不是 payload 长度）：如果 (code,date) 对不上，
+        # 真实更新是 0，调用方/日志才看得出来 —— 以前返回 payload 长度，
+        # 明明一行都没写上也报"成功 N 行"。
+        total += conn.total_changes - before
     return total
 
 
@@ -375,7 +397,14 @@ def load_dividends(conn, code: str, since: str | None = None) -> list[dict]:
 # 标的元信息（stock_basic 表）
 # =====================================================================
 def upsert_stock_basic(conn, rows) -> int:
-    """写入标的元信息。rows: [{code, name, ktype, market, industry, listed_date}]。"""
+    """写入标的元信息。rows: [{code, name, ktype, market, industry, listed_date}]。
+
+    **不能用 INSERT OR REPLACE**：那是"先 DELETE 再 INSERT"，没出现的列会被抹成
+    NULL。而 `sync_constituents` 每次拉取都会把**所有成分股**upsert 进来，那条路径
+    只带 {code,name,ktype,market} —— 于是每跑一次拉取，就把 `sync_stock_basics`
+    刚补好的 industry / listed_date 全部抹掉一次，覆盖率永远停在个位数百分比。
+    改为 UPSERT + COALESCE：新值为 NULL 时保留原值。
+    """
     now = _now()
     payload = [(r.get("code"), r.get("name"), r.get("ktype"), r.get("market"),
                 r.get("industry"), r.get("listed_date"), now)
@@ -383,8 +412,16 @@ def upsert_stock_basic(conn, rows) -> int:
     if not payload:
         return 0
     conn.executemany(
-        "INSERT OR REPLACE INTO stock_basic"
-        "(code,name,ktype,market,industry,listed_date,updated_at) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO stock_basic"
+        "(code,name,ktype,market,industry,listed_date,updated_at) "
+        "VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(code) DO UPDATE SET "
+        "name=COALESCE(excluded.name, stock_basic.name), "
+        "ktype=COALESCE(excluded.ktype, stock_basic.ktype), "
+        "market=COALESCE(excluded.market, stock_basic.market), "
+        "industry=COALESCE(excluded.industry, stock_basic.industry), "
+        "listed_date=COALESCE(excluded.listed_date, stock_basic.listed_date), "
+        "updated_at=excluded.updated_at",
         payload)
     conn.commit()
     return len(payload)
@@ -728,16 +765,20 @@ def kline_span(conn, code: str) -> dict:
     return {"first": row["first"], "last": row["last"], "rows": row["n"] or 0}
 
 
-def update_stock_basic_info(conn, rows) -> int:
+def update_stock_basic_info(conn, rows, batch: int = 300) -> int:
     """只更新 stock_basic 的 industry / listed_date（不动 name/ktype/market）。
 
     rows: [{code, industry?, listed_date?}]；某字段为 None/缺省时保持原值。
     用定点 UPDATE 而不是 upsert_stock_basic——后者是 INSERT OR REPLACE，
     只带行业/上市日会把已有的 name/ktype/market 抹成 NULL。
+
+    **按批提交**（而不是全部更新完再提交一次）：全市场有几千条，中途一旦失败，
+    一次性提交会让**已经写成功的部分全部回滚** —— 实测生产库里这两个字段的覆盖率
+    长期停在 6%，就是这么一点点丢掉的。按批提交保证部分成功也能留下。
     """
     now = _now()
     n = 0
-    for r in rows:
+    for i, r in enumerate(rows, 1):
         code = r.get("code")
         if not code:
             continue
@@ -753,6 +794,8 @@ def update_stock_basic_info(conn, rows) -> int:
         cur = conn.execute(
             f"UPDATE stock_basic SET {','.join(sets)} WHERE code=?", params)
         n += cur.rowcount
+        if i % batch == 0:
+            conn.commit()
     conn.commit()
     return n
 
@@ -766,6 +809,158 @@ def get_sync(conn, code: str, dtype: str) -> dict | None:
         "SELECT code,dtype,last_date,row_count,updated_at FROM sync_state "
         "WHERE code=? AND dtype=?", (code, dtype)).fetchone()
     return dict(row) if row else None
+
+
+#: sync_state 里"分位历史已补齐"的 dtype 标记
+PCT_HISTORY_DTYPE = "pct_history"
+#: sync_state 里"历史分位需要整条重算"的 dtype 标记（输入数据变了）
+PCT_DIRTY_DTYPE = "pct_dirty"
+
+
+def score_kline_coverage(conn) -> dict:
+    """每个标的的 K 线行数 / 评分行数，用来判断**分位历史是否残缺**。
+
+    只看「最新一天有没有评分」是不够的：后加入的个股（例如刚被拉进个股池的）
+    可能只在最新一天算过一次，历史整条都是空的 —— 那要靠行数对比才看得出来。
+    """
+    kl = {r[0]: r[1] for r in conn.execute(
+        "SELECT code, count(*) FROM kline GROUP BY code")}
+    sc = {r[0]: r[1] for r in conn.execute(
+        "SELECT code, count(*) FROM valuation_score GROUP BY code")}
+    return {code: {"kline": n, "scores": sc.get(code, 0)}
+            for code, n in kl.items()}
+
+
+def history_built_codes(conn) -> set:
+    """已补齐过分位历史的标的（sync_state 里打了 pct_history 标记的）。"""
+    return {r[0] for r in conn.execute(
+        "SELECT code FROM sync_state WHERE dtype=?", (PCT_HISTORY_DTYPE,))}
+
+
+def mark_history_built(conn, code: str, last_date: str | None = None,
+                       row_count: int = 0) -> None:
+    """标记某标的的分位历史已补齐。
+
+    打上之后只补最新交易日，不再全量重建；否则每天都会把整条历史重算一遍，
+    而且早期日期（窗口长度不够、分位天然算不出来）会永远被当成"缺失"反复重试。
+    """
+    set_sync(conn, code, PCT_HISTORY_DTYPE, last_date=last_date,
+             row_count=row_count, incremental=False)
+
+
+#: sync_state 里"计算指标上次跑完时的数据指纹"的哨兵 code（不是真实标的）
+COMPUTE_FP_CODE = "__compute__"
+#: sync_state 里"某组合K线上次合成时的数据指纹"
+PF_FP_DTYPE = "pf_fp"
+#: sync_state 里"前复权历史修正重拉失败，需要重试"的待办标记
+READJUST_DTYPE = "kline_readjust"
+
+
+def mark_readjust_pending(conn, code: str, reason: str = "") -> None:
+    """标记某标的的**前复权历史需要重拉修正**（上次重拉失败了）。
+
+    为什么必须单独记：新分红会让 baostock 的前复权历史整体变化，所以第 ⑦ 步要
+    全历史重拉。但分红记录这时**已经落库**了，下一轮 `sync_dividends` 不会再报
+    "新分红"，重拉就再也不会被触发 —— 失败会静默永久丢失，库里那只股票的历史
+    会**混着两套复权基准**（旧的一段 + 新的一段），且不报任何错。
+    """
+    set_sync(conn, code, READJUST_DTYPE, last_date=_now()[:10], row_count=0,
+             incremental=False)
+    if reason:
+        log.warning("%s 前复权历史需重拉（已记为待办）：%s", code, reason)
+
+
+def readjust_pending_codes(conn) -> set:
+    """前复权历史待重拉修正的标的。"""
+    return {r[0] for r in conn.execute(
+        "SELECT code FROM sync_state WHERE dtype=?", (READJUST_DTYPE,))}
+
+
+def clear_readjust_pending(conn, code: str) -> None:
+    """重拉成功后清掉待办标记。"""
+    conn.execute("DELETE FROM sync_state WHERE code=? AND dtype=?",
+                 (code, READJUST_DTYPE))
+    conn.commit()
+
+
+#: 取数侧（data_fetcher）写的 sync_state dtype —— 只有它们变了才算"数据变了"。
+#: 用白名单而不是黑名单：计算任务以后再加新的 dtype 也不会悄悄把闸门弄坏
+#: （黑名单就踩过这个坑：计算任务自己写 pf_fp，把指纹改了，早退永远不生效）。
+_FETCH_DTYPES = ("kline", "dividend", "constituent", "close_raw",
+                 "trade_date", "kline_full")
+
+
+def data_fingerprint(conn) -> str:
+    """数据指纹 = **取数侧**最后写入的时间戳，用于"数据没变就不用重算"。
+
+    只认上面白名单里的 dtype（都是 data_fetcher 写的），计算任务自己写的
+    （pct_history / pct_dirty / pf_fp / 哨兵行）一律不算 —— 否则计算任务
+    一写标记就把指纹改了，"数据没变就早退"永远不生效。
+
+    实测 0.3ms（sync_state 只有两千行），比"重建一遍再发现没事"便宜太多。
+    """
+    ph = ",".join("?" * len(_FETCH_DTYPES))
+    row = conn.execute(
+        f"SELECT MAX(updated_at) FROM sync_state WHERE dtype IN ({ph})",
+        _FETCH_DTYPES).fetchone()
+    return (row[0] if row and row[0] else "")
+
+
+def get_compute_fingerprint(conn) -> str | None:
+    """上次"数据没变、也没留下待办"时记录的数据指纹；没有则 None。"""
+    rec = get_sync(conn, COMPUTE_FP_CODE, "fingerprint")
+    if rec and rec.get("row_count") == 1:
+        return rec.get("last_date")
+    return None
+
+
+def set_compute_fingerprint(conn, fingerprint: str) -> None:
+    """记录"这次跑完是干净的"（数据没变 + 没有待办），下次可据此早退。"""
+    set_sync(conn, COMPUTE_FP_CODE, "fingerprint", last_date=fingerprint,
+             row_count=1, incremental=False)
+
+
+def get_portfolio_fingerprint(conn, code: str) -> str | None:
+    """某组合上次合成 K 线时的数据指纹。"""
+    rec = get_sync(conn, code, PF_FP_DTYPE)
+    return rec.get("last_date") if rec else None
+
+
+def set_portfolio_fingerprint(conn, code: str, fingerprint: str) -> None:
+    set_sync(conn, code, PF_FP_DTYPE, last_date=fingerprint, row_count=1,
+             incremental=False)
+
+
+def mark_history_dirty(conn, code: str, reason: str = "") -> None:
+    """标记某标的的历史分位**需要整条重算**（它的输入数据变了）。
+
+    这是"取数改了原始数据 → 计算要重算派生历史"之间缺的那一环：
+    例如 `close_raw` 补齐后 `div_yield` 才算得出来，历史股息率分位就全变了。
+    光靠"评分行数/K线行数"的覆盖率判据发现不了这种变化（K线行数没变），
+    所以必须由**改数据的那一方**显式打标记。
+
+    同时清掉"已补齐"标记 —— 否则 history_gap_codes 会以为这只已经核对过。
+    """
+    set_sync(conn, code, PCT_DIRTY_DTYPE, last_date=_now()[:10], row_count=0,
+             incremental=False)
+    conn.execute("DELETE FROM sync_state WHERE code=? AND dtype=?",
+                 (code, PCT_HISTORY_DTYPE))
+    conn.commit()
+    if reason:
+        log.info("%s 的历史分位已标记为需重算：%s", code, reason)
+
+
+def dirty_codes(conn) -> set:
+    """历史分位需要重算的标的。"""
+    return {r[0] for r in conn.execute(
+        "SELECT code FROM sync_state WHERE dtype=?", (PCT_DIRTY_DTYPE,))}
+
+
+def clear_history_dirty(conn, code: str) -> None:
+    """清掉"需要重算"的标记（重算完成后调用）。"""
+    conn.execute("DELETE FROM sync_state WHERE code=? AND dtype=?",
+                 (code, PCT_DIRTY_DTYPE))
+    conn.commit()
 
 
 def set_sync(conn, code: str, dtype: str, last_date: str | None = None,

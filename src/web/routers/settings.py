@@ -162,8 +162,8 @@ def _ensure_keys(sections: list) -> bool:
 def _prune_keys(sections: list, known: set) -> bool:
     """剔除已从系统里删掉的配置键（老库残留），返回是否有改动。
 
-    例如 BAOSTOCK_ADJUSTFLAG / SCHEDULER_HEARTBEAT_MINUTES 已废弃，
-    config.ensure_settings() 会把它们从 setting 表删掉，但 SETTING_GROUPS
+    例如 SCHEDULER_HEARTBEAT_MINUTES 已废弃，
+    config.ensure_settings() 会把它从 setting 表删掉，但 SETTING_GROUPS
     里仍留着引用，设置页就会渲染出空壳配置项。
     """
     changed = False

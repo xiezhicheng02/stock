@@ -187,16 +187,17 @@ def smtp_source_note() -> str:
 # =====================================================================
 # MAIN_RUN_* / ALERT_RUN_*：早期 cron 方案的主跑时段/盘中告警时段，已由
 #   APScheduler 的 SYNC_RUN_TIME / NOTIFY_* 取代。
-# BAOSTOCK_ADJUSTFLAG：复权方式必须固定（日线前复权、close_raw 不复权），
-#   开放出来会让指标口径错乱，已改为代码常量。
 # SCHEDULER_HEARTBEAT_*：从未实现心跳任务，任务列表的 next_run 已能反映调度器活性。
+#
+# 注：BAOSTOCK_ADJUSTFLAG 曾经也在这张墓碑清单里。它早已从本库清掉、新库也不会再
+#   写入，留着只是占用；复权方式固定为代码常量（见 data_fetcher 的 ADJUST_KLINE /
+#   ADJUST_RAW），设置页不暴露，因此已删除这条墓碑。
 DEPRECATED_SETTINGS = (
     "RUN_WEEKDAYS",          # 由 baostock 股市日历替代（见 SKIP_NON_TRADING_DAY）
     "MAIN_RUN_HOUR",
     "MAIN_RUN_MINUTE",
     "ALERT_RUN_HOURS",
     "ALERT_RUN_MINUTE",
-    "BAOSTOCK_ADJUSTFLAG",
     "SCHEDULER_HEARTBEAT_MINUTES",
     "SCHEDULER_HEARTBEAT_AT",
 )

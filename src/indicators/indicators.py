@@ -248,8 +248,21 @@ def rebuild_index_valuation(conn, index_code: str, start: str | None = None,
         log.warning("%s 无指数K线，无法确定聚合日期轴", index_code)
         return 0
     if only_missing:
-        want = {r["date"] for r in axis
-                if r["pe_ttm"] is None or r["div_yield"] is None}
+        # 缺失判据**只看 pe_ttm**，不看 div_yield。
+        #
+        # 以前是 `pe_ttm is None or div_yield is None`，结果每轮都要重算上千天：
+        # 个股的 div_yield 要先有 close_raw（不复权收盘价）才能算，而全库只有约
+        # 6% 的 K 线行有 close_raw —— 那些历史日期的 div_yield **永远算不出来**，
+        # 于是被当成"缺失"反复重算（实测 sh.000300 1209 天 / sh.000905 1104 天，
+        # 每 30 分钟白跑 ~23s）。
+        #
+        # pe_ttm 是聚合的"主指标"，新交易日的数据拉进来时它就是 NULL，
+        # 所以这个判据本身就能自然覆盖新增日期，不需要额外水位。
+        # 历史 div_yield 的补齐要靠全量重建（only_missing=False），
+        # 前提是先补上成分股的 close_raw（那是取数侧的事）。
+        want = {r["date"] for r in axis if r["pe_ttm"] is None}
+        # 最近 overlap 个交易日无论缺不缺都要重算：盘中跑批会把当天的盘中快照
+        # 算进去，收盘后需要覆盖修正。
         want.update(r["date"] for r in axis[-max(1, overlap):])
         dates = sorted(want)
     else:
@@ -607,8 +620,14 @@ def index_score(conn, index_code: str, years: int | None = None,
         w = weights.get(code)
         if not w:
             continue
-        p10 = stock_metric_percentiles(conn, code, years, as_of=ref_date)
-        p5 = stock_metric_percentiles(conn, code, years_ref, as_of=ref_date)
+        # 优先复用成分股**已落库**的分位（个股先算完 → 这里直接读，省掉重算）；
+        # 该日没有存档时才回退到从 kline 现算（例如库还没建过这只的历史分位）。
+        stored = _stored_pcts_asof(conn, code, ref_date)
+        if stored and any(v is not None for v in stored[0].values()):
+            p10, p5 = stored
+        else:
+            p10 = stock_metric_percentiles(conn, code, years, as_of=ref_date)
+            p5 = stock_metric_percentiles(conn, code, years_ref, as_of=ref_date)
         hit = False
         for m in METRICS:
             if p10.get(m) is not None:
@@ -816,6 +835,23 @@ def _weights_by_date(conn, codes, dates, chunk: int = 200) -> dict:
         for d, rows in buckets.items():
             out[d] = calc_market_weights(rows)
     return out
+
+
+def _stored_pcts_asof(conn, code: str, ref_date: str):
+    """读某标的**在 ref_date 当天已落库**的分位（10 年/5 年），没有则返回 None。
+
+    指数/组合聚合时用：成分股的分位刚才已经算好落库了，没必要再从 kline 原始
+    数据重算一遍（10 年窗口 + 排序，上千只成分股就是几十秒）。
+    """
+    fields = (("date",) + tuple(_PCT_COL.values()) + tuple(_PCT5_COL.values()))
+    rows = storage.load_scores(conn, code, start=ref_date, end=ref_date,
+                              fields=fields)
+    if not rows:
+        return None
+    r = rows[-1]
+    p10 = {m: r.get(_PCT_COL[m]) for m in METRICS}
+    p5 = {m: r.get(_PCT5_COL[m]) for m in METRICS}
+    return p10, p5
 
 
 def _stored_percentile_series(conn, code: str):
@@ -1027,7 +1063,8 @@ def _rebuild_worker(args) -> dict:
         config.use_db(db_path)
     conn = storage.get_conn()
     try:
-        n_dy = fill_dividend_yield(conn, code, full=True) if dividend_full else 0
+        n_dy = (fill_dividend_yield(conn, code, full=True)["rows"]
+                if dividend_full else 0)
         n = rebuild_score_history(conn, code, ktype=ktype, freq=freq, clean=clean)
         return {"code": code, "ok": True, "rows": n, "div_yield": n_dy}
     except Exception as e:                          # noqa: BLE001
@@ -1161,12 +1198,36 @@ def update_latest_percentiles(conn) -> int:
 # =====================================================================
 # 动态股息率（离线计算）
 # =====================================================================
+#: 股息率变化的日期早于"最近这么多天"才算**历史性变化**（需要重算历史分位）。
+#: 日常增量只会重写最近 KLINE_OVERLAP_DAYS(10) 天，那种变化由"补最新一天"覆盖，
+#: 没必要为它整条重建；只有真的动到历史（全量重拉、close_raw 补齐）才重建。
+DIVIDEND_HISTORICAL_DAYS = 30
+
+
+def _div_change_is_historical(conn, code: str, first_changed: str | None) -> bool:
+    """这次股息率变化是否触及历史（而不是最近几天）。"""
+    if not first_changed:
+        return False
+    last = storage.latest_kline_date(conn, code)
+    if not last:
+        return False
+    cutoff = (date.fromisoformat(last)
+              - timedelta(days=DIVIDEND_HISTORICAL_DAYS)).isoformat()
+    return first_changed < cutoff
+
+
 def fill_dividend_yields(conn, codes=None, full: bool = False) -> int:
     """批量计算个股的动态股息率（离线：读 kline.close_raw + dividend 表）。
 
-    full=False（日常增量）：只处理存在 div_yield 空值的个股——拉取数据用
-        INSERT OR REPLACE 重写 K 线后，被重写的日期会置空，这里据此精确补算。
+    full=False（日常增量）：只处理**既有空值、又有 close_raw** 的个股——
+        K 线被重写后 div_yield 会置空，这里据此精确补算。
+        加 close_raw 过滤是因为：没有 close_raw 就**根本算不出来**
+        （全库一度只有 6% 的行有 close_raw），不过滤会白遍历 700 多只、
+        加载它们全部 K 线，几秒起步却一行都补不上。
     full=True（全量）：处理**全部**个股、全历史重算（全量重建用）。
+
+    **历史性变化会打 `pct_dirty` 标记**，让「计算指标」下次重建该标的的历史分位
+    —— div_yield 变了，历史股息率分位就全变了，而覆盖率判据发现不了这种变化。
 
     返回更新的行数。
     """
@@ -1176,20 +1237,25 @@ def fill_dividend_yields(conn, codes=None, full: bool = False) -> int:
                 "SELECT DISTINCT code FROM kline WHERE ktype='stock'").fetchall()
         else:
             rows = conn.execute(
-                "SELECT DISTINCT code FROM kline "
-                "WHERE ktype='stock' AND div_yield IS NULL").fetchall()
+                "SELECT DISTINCT code FROM kline WHERE ktype='stock' "
+                "AND div_yield IS NULL AND close_raw IS NOT NULL").fetchall()
         codes = [r[0] for r in rows]
     total = 0
     for code in codes:
         try:
-            total += fill_dividend_yield(conn, code, full=full)
+            r = fill_dividend_yield(conn, code, full=full)
+            total += r["rows"]
+            # 股息率的历史值变了 → 历史分位作废，交给下次 compute 重建
+            if _div_change_is_historical(conn, code, r["first"]):
+                storage.mark_history_dirty(
+                    conn, code, f"股息率历史变化（{r['first']} 起 {r['rows']} 行）")
         except Exception as e:                      # noqa: BLE001
             log.warning("%s 股息率计算失败：%s", code, e)
     return total
 
 
-def fill_dividend_yield(conn, code: str, full: bool = False) -> int:
-    """计算并写回某只个股的动态股息率。
+def fill_dividend_yield(conn, code: str, full: bool = False) -> dict:
+    """计算并写回某只个股的动态股息率。返回 {rows, first}。
 
     div_yield(某日) = 该日及之前 N 天内每股现金分红之和 / 当日不复权收盘价 × 100
     N = config 的 DIVIDEND_LOOKBACK_DAYS（默认 365，即近 12 个月）
@@ -1197,11 +1263,14 @@ def fill_dividend_yield(conn, code: str, full: bool = False) -> int:
     full=False 只补空值行；full=True 全历史重算。
     **没有分红记录 → 股息率按 0 处理**（缺分红/无分红都置 0，不再跳过）。
     close_raw 缺失（停牌等拿不到不复权价）→ 该行保留原值不动。
+
+    first = 本次改动的最早日期（没改动则 None）。调用方用它判断这次变化是否
+    触及历史、要不要把该标的的历史分位标记为需重算。
     """
     lookback = int(config.baostock().get("dividend_lookback_days", 365))
     krows = storage.load_kline(conn, code, fields=("date", "close_raw", "div_yield"))
     if not krows:
-        return 0
+        return {"rows": 0, "first": None}
 
     # 分红按除息日升序；窗口 [d-N, d] 用双指针维护和（避免每行都线性扫描分红表）
     divs = sorted(storage.load_dividends(conn, code), key=lambda x: x["ex_date"])
@@ -1230,22 +1299,261 @@ def fill_dividend_yield(conn, code: str, full: bool = False) -> int:
             continue                                  # 值没变就不写（省写入）
         outs.append({"date": d, "div_yield": new_v})
     if not outs:
-        return 0
-    return storage.update_valuation_fields(conn, code, outs)
+        return {"rows": 0, "first": None}
+    n = storage.update_valuation_fields(conn, code, outs)
+    return {"rows": n, "first": outs[0]["date"] if n else None}
+
+
+def compute_target(conn, code: str, ktype: str, full: bool = False) -> dict:
+    """算一个标的：股息率 →（指数估值聚合 / 组合K线合成）→ 当日分位与评分。
+
+    **纯离线**（只读 kline / dividend），不联网。取数由 data_fetcher 负责，
+    这里只负责算 —— 手动「拉取单只标的」的编排见 pipeline.sync_target。
+
+    与 compute_all 的分工：那个是"全库批量补"，这个是"单个标的即时算"。
+    """
+    out = {}
+    if ktype == "index":
+        out["dividend_yield_filled"] = fill_dividend_yields(
+            conn, storage.load_constituents(conn, code))
+        rebuild_index_valuation(conn, code, only_missing=not full)
+        r = index_score(conn, code)
+    elif ktype == "portfolio":
+        out["dividend_yield_filled"] = fill_dividend_yields(
+            conn, storage.load_constituents(conn, code))
+        out["kline_synth"] = rebuild_portfolio_kline(conn, code)
+        r = portfolio_score(conn, code)
+    else:
+        fr = fill_dividend_yield(conn, code)
+        out["dividend_yield_filled"] = fr["rows"]
+        if _div_change_is_historical(conn, code, fr["first"]):
+            storage.mark_history_dirty(
+                conn, code, f"股息率历史变化（{fr['first']} 起）")
+        r = stock_score(conn, code)
+    out["score"] = (r or {}).get("score")
+    out["status"] = (r or {}).get("status")
+    return out
 
 
 # =====================================================================
 # 编排
 # =====================================================================
-def compute_all(conn, save_score: bool = True, rebuild_valuation: bool = True):
-    """「计算指标」任务：股息率补空 → 指数估值 → 组合K线 → 评分 → 全标的最新分位。
+#: 判定"分位历史已完整"的覆盖率阈值：评分行数 / K线行数
+HISTORY_COMPLETE_RATIO = 0.9
 
-    纯离线计算，全部结果落库。返回 {dividend_yield_filled, scored, percentiles}。
+
+def history_gap_codes(conn) -> list[tuple]:
+    """找出**分位历史需要重算**的标的 [(code, ktype)]。
+
+    判据（满足其一就重算）：
+      * 打了 `pct_dirty` 标记 —— 输入数据变了（例如 close_raw 补齐后 div_yield
+        才算得出来），历史分位整条作废。**这种变化覆盖率判据看不出来**
+        （K 线行数没变），所以必须由改数据的那一方显式标记；
+      * 没打过 `pct_history` 标记，且「评分行数 / K线行数」低于
+        HISTORY_COMPLETE_RATIO —— 例如刚被拉进个股池、只在最新一天算过一次。
+
+    为什么不用「分位字段 IS NULL」当判据：早期交易日的窗口长度不够，
+    分位**天然算不出来**（永远是 NULL）。拿它当"缺失"会让每轮任务都去重试
+    这几十万天，永远补不上，纯烧 CPU。
     """
-    n_dy = fill_dividend_yields(conn)
-    results = run(conn, rebuild_valuation=rebuild_valuation, save_score=save_score)
-    n_pct = update_latest_percentiles(conn)
-    return {"dividend_yield_filled": n_dy, "scored": results, "percentiles": n_pct}
+    built = storage.history_built_codes(conn)
+    dirty = storage.dirty_codes(conn)
+    cov = storage.score_kline_coverage(conn)
+    out = []
+    for code, ktype in all_percentile_codes(conn):
+        c = cov.get(code)
+        if code in dirty:
+            out.append((code, ktype))            # 输入变了 → 无条件重算
+            continue
+        if code in built:
+            continue
+        if not c or not c["kline"]:
+            continue
+        if c["scores"] / c["kline"] < HISTORY_COMPLETE_RATIO:
+            out.append((code, ktype))
+    return out
+
+
+def _history_worker(args) -> dict:
+    """多进程工作单元：整条重建某标的的分位/评分历史，并打上"已补齐"标记。
+
+    顶层函数（可 pickle），供 ProcessPoolExecutor 调用。
+    """
+    code, ktype, freq, db_path = args
+    if db_path and db_path != config.DB_PATH:
+        config.use_db(db_path)
+    conn = storage.get_conn()
+    try:
+        n = rebuild_score_history(conn, code, ktype=ktype, freq=freq, clean=True)
+        last = storage.latest_kline_date(conn, code)
+        storage.mark_history_built(conn, code, last_date=last, row_count=n)
+        # 重算完就把"需重算"标记清掉，否则每轮都会再重建一次
+        storage.clear_history_dirty(conn, code)
+        return {"code": code, "ok": True, "rows": n}
+    except Exception as e:                          # noqa: BLE001
+        log.warning("%s 历史分位重建失败：%s", code, e)
+        return {"code": code, "ok": False, "rows": 0, "error": str(e)}
+    finally:
+        conn.close()
+
+
+def _agg_worker(args) -> dict:
+    """多进程工作单元：算一个指数/组合的当日分位与评分（落库）。
+
+    **必须等个股分位落库之后**才能跑 —— 它读的是成分股已存的分位。
+    """
+    code, ktype, db_path = args
+    if db_path and db_path != config.DB_PATH:
+        config.use_db(db_path)
+    conn = storage.get_conn()
+    try:
+        r = index_score(conn, code, save=True, ktype=ktype)
+        return {"code": code, "ok": r is not None,
+                "score": (r or {}).get("score")}
+    except Exception as e:                          # noqa: BLE001
+        log.warning("%s 分位/评分计算失败：%s", code, e)
+        return {"code": code, "ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+def resolve_workers(n_tasks: int, workers: int | None = None) -> int:
+    """并发进程数：取 REBUILD_WORKERS（0=自动 = min(3, 核数-1)），并夹到任务数。"""
+    if workers is None:
+        workers = config.get_int("REBUILD_WORKERS", 0) or 0
+    if workers <= 0:
+        # 树莓派 3B+ 是 4 核：留 1 核给 web/调度器，避免跑批时页面卡死
+        workers = max(1, min(3, (os.cpu_count() or 2) - 1))
+    return max(1, min(workers, n_tasks or 1))
+
+
+def _run_parallel(tasks: list, worker, workers: int) -> tuple:
+    """把 tasks 交给多进程跑（workers<=1 或只有 1 个任务时串行）。返回 (ok, rows)。"""
+    ok = rows = 0
+    if not tasks:
+        return 0, 0
+    # 任务太少就别开进程池：进程启动（web 线程里是 spawn，每个要重新 import 模块）
+    # 本身比这点活儿还贵。每个进程至少要摊到 2 个任务才划算。
+    if workers > 1 and len(tasks) < 2 * workers:
+        workers = 1
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing as mp
+        import threading as _threading
+        # 单线程进程（命令行）用 fork：最快；多线程进程（web 后台线程）用 spawn：
+        # 避免 fork 继承到别的线程持有的锁而死锁。
+        try:
+            ctx = mp.get_context("fork" if _threading.active_count() == 1
+                                 else "spawn")
+        except ValueError:                          # 平台不支持 fork
+            ctx = mp.get_context()
+        log.info("并发计算 %d 个任务，%d 进程（%s）",
+                 len(tasks), workers, ctx.get_start_method())
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+            for res in ex.map(worker, tasks, chunksize=2):
+                ok += 1 if res.get("ok") else 0
+                rows += res.get("rows") or 0
+    else:
+        log.info("串行计算 %d 个任务（workers=%d）", len(tasks), workers)
+        for t in tasks:
+            res = worker(t)
+            ok += 1 if res.get("ok") else 0
+            rows += res.get("rows") or 0
+    return ok, rows
+
+
+def compute_all(conn, save_score: bool = True, rebuild_valuation: bool = True,
+                workers: int | None = None):
+    """「计算指标」任务：检查所有个股/指数/组合的分位，缺什么补什么。
+
+    阶段之间**有依赖，顺序不能换**：
+
+      ① 补股息率        —— 个股动态股息率（只补空的）
+      ② 个股分位（并发）—— 历史残缺的整条重建；历史完整的不用管（最新一天由 ⑤ 兜底）
+      ③ 组合 K 线落库   —— 组合的分位要靠它当日期轴，**必须先建 K 线再算分位**
+      ④ 指数/组合聚合（并发）—— 读 ② 已落库的个股分位加权，不重算
+      ⑤ 兜底补最新      —— 所有标的的最新交易日；已经是最新的直接跳过
+
+    纯离线计算（读 kline/dividend），不联网。返回统计字典
+    （含 `fingerprint`，供调用方判断"数据没变、也没留待办"时下次早退）。
+    """
+    t0 = datetime.now()
+    # 取数侧的数据指纹：本轮的"输入版本"。既用于判断组合K线要不要重合成，
+    # 也回传给调用方，作为"这轮跑完是干净的"的凭据。
+    fp = storage.data_fingerprint(conn)
+    out = {"ok": True, "started_at": t0.strftime("%Y-%m-%d %H:%M:%S"),
+           "fingerprint": fp}
+
+    # ① 股息率（个股，只补空值；历史性变化会打 pct_dirty 让 ② 重建）
+    out["dividend_yield_filled"] = fill_dividend_yields(conn)
+
+    # ② 个股：只有历史残缺 / 被标脏的才需要整条重建（实测 0.2~0.5s/只）
+    gaps = history_gap_codes(conn)
+    stock_gaps = [(c, k) for c, k in gaps if k == "stock"]
+    agg_gaps = [(c, k) for c, k in gaps if k != "stock"]
+
+    # ③ 组合 K 线：必须在组合分位之前落库（组合用自身 K 线做日期轴）。
+    # 按需重建：输入数据指纹没变、且组合 K 线已经到最新交易日，就跳过 ——
+    # 否则每轮都要重写 2800+1700 行，一天几十次是白磨 SD 卡。
+    n_port, port_skipped = 0, 0
+    port_end = storage.latest_trade_date(conn, on_or_before=date.today().isoformat())
+    for t in config.targets():
+        if t["ktype"] != "portfolio":
+            continue
+        code = t["code"]
+        last = storage.latest_kline_date(conn, code)
+        fresh = bool(last and port_end and last >= port_end)
+        if fresh and storage.get_portfolio_fingerprint(conn, code) == fp:
+            port_skipped += 1
+            continue
+        try:
+            n_port += rebuild_portfolio_kline(conn, code)
+            storage.set_portfolio_fingerprint(conn, code, fp)
+        except Exception as e:                      # noqa: BLE001
+            log.warning("%s 组合K线合成失败：%s", code, e)
+    out["portfolio_rows"] = n_port
+    out["portfolio_skipped"] = port_skipped
+
+    # 指数估值聚合（写回指数K线的五指标绝对值，供估值列/图表用）
+    if rebuild_valuation:
+        for t in config.targets():
+            if t["ktype"] == "index":
+                try:
+                    rebuild_index_valuation(conn, t["code"], only_missing=True)
+                except Exception as e:              # noqa: BLE001
+                    log.warning("%s 指数估值聚合失败：%s", t["code"], e)
+
+    # ② 个股历史补齐（并发；组合的历史放在 ③ 之后一起补）
+    w = resolve_workers(len(stock_gaps) + len(agg_gaps), workers)
+    db_path = config.DB_PATH
+    ok_s, rows_s = _run_parallel(
+        [(c, k, "D", db_path) for c, k in stock_gaps], _history_worker, w)
+    out["history_stocks"] = len(stock_gaps)
+    out["history_stock_rows"] = rows_s
+    out["history_stock_ok"] = ok_s
+
+    # 组合历史：K 线已落库，可以补了
+    ok_p, rows_p = _run_parallel(
+        [(c, k, "D", db_path) for c, k in agg_gaps], _history_worker, w)
+    out["history_agg"] = len(agg_gaps)
+    out["history_agg_rows"] = rows_p
+
+    # ④ 指数 / 组合：聚合成分股已存分位 → 落综合评分（并发）
+    agg_targets = [(t["code"], t["ktype"]) for t in config.targets()
+                   if t["ktype"] in ("index", "portfolio")]
+    ok_a, _ = _run_parallel(
+        [(c, k, db_path) for c, k in agg_targets], _agg_worker,
+        resolve_workers(len(agg_targets), workers))
+    out["agg_ok"] = ok_a
+    out["agg_total"] = len(agg_targets)
+
+    # ⑤ 兜底：所有标的的最新交易日（缺才补，幂等）
+    out["percentiles"] = update_latest_percentiles(conn)
+
+    # 记录"当前已最新的标的数"供日志/结果展示
+    out["lagging"] = len(history_gap_codes(conn))
+    out["elapsed"] = round((datetime.now() - t0).total_seconds(), 1)
+    return out
 
 
 def run(conn, rebuild_valuation: bool = True, save_score: bool = True,
