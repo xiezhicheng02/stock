@@ -107,7 +107,7 @@ DEFAULT_SETTINGS = [
     ("WEB_HEALTH_REFRESH_SEC", 300, "int", "web",
      "顶栏健康检查(/api/health)的自动刷新间隔(秒)，0=只在打开页面时查一次。"
      "它只决定顶栏那行状态文字多久更新，5 分钟足够"),
-    ("WEB_STATS_CACHE_SEC", 60, "int", "web",
+    ("WEB_STATS_CACHE_SEC", 300, "int", "web",
      "首页统计缓存秒数：首页几个统计查询很贵（树莓派上每次数秒），缓存后"
      "30 秒一次的自动刷新几乎不花代价。0=不缓存"),
     ("WEB_AUTH_TOKEN", "", "str", "web",

@@ -192,8 +192,22 @@ def favicon():
 # 接口（占位：先打通链路，业务接口后续再加）
 # =====================================================================
 @app.get("/api/health", summary="服务与数据库健康状态")
-def health(_: None = Depends(deps.require_auth)):
-    """服务探针：进程、数据库、各表行数、调度器状态。"""
+def health(full: bool = False, _: None = Depends(deps.require_auth)):
+    """服务探针：进程 + 展示配置 + 调度器状态。
+
+    **默认只返回页面真正用到的东西**（`meta` 供前端重建估值区间/配色/窗口）。
+    那批"数据库体检"字段（各表行数、K线/评分覆盖）要加 `?full=1` 才做：
+
+      * `latest_kline_dates()` 779ms、`latest_score_dates()` 803ms（本机；
+        树莓派上各要好几秒）、`table_stats()` 93ms —— 都是全表统计；
+      * 而**没有任何消费者**：前端顶栏只读 `meta`/`version`/`ok`；
+        `run_web.sh status` 只读 `scheduler`/`runtime`；首页那些"有K线标的/
+        有评分标的/交易日历"来自 `/api/dashboard`，不是这里。
+
+    以前这些默认就带，等于每次顶栏刷新（默认 5 分钟一次）都在做 ~1.7 秒的
+    无人使用的重活。另外 `score_latest` 原来返回**整个 {code: 日期} 字典**
+    （860 条），现在改成"最新评分日期"这个标量 —— 那才是字段名该有的意思。
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     out = {
         "ok": True,
@@ -215,17 +229,20 @@ def health(_: None = Depends(deps.require_auth)):
     try:
         conn = deps.conn()
         try:
+            # 只做一次极便宜的连通性检查；重活都放到 ?full=1
+            conn.execute("SELECT 1").fetchone()
             out["db"]["ok"] = True
-            out["db"]["tables"] = storage.table_stats(conn)
-            # K线覆盖情况：标的数 + 最新日期（一次分组查询，避免逐只查）
-            kd = storage.latest_kline_dates(conn)
-            out["db"]["kline_codes"] = len(kd)
-            out["db"]["kline_latest"] = max(kd.values()) if kd else None
-            out["db"]["score_latest"] = storage.latest_score_dates(conn)
-            # 交易日历覆盖 + 今天是否交易日
             lo, hi = storage.trade_date_range(conn)
             out["runtime"]["trade_calendar"] = {"start": lo, "end": hi}
             out["runtime"]["is_trading_today"] = pipeline.is_trading_day(conn, now[:10])
+            if full:
+                out["db"]["tables"] = storage.table_stats(conn)
+                kd = storage.latest_kline_dates(conn)
+                out["db"]["kline_codes"] = len(kd)
+                out["db"]["kline_latest"] = max(kd.values()) if kd else None
+                # 标量即可（原来返回 860 条 {code: 日期} 的字典，没人用）
+                out["db"]["score_latest"] = conn.execute(
+                    "SELECT MAX(date) FROM valuation_score").fetchone()[0]
         finally:
             conn.close()
     except Exception as e:                      # noqa: BLE001
