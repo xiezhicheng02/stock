@@ -284,9 +284,12 @@ def rebuild_index_valuation(conn, index_code: str, start: str | None = None,
         weights = calc_market_weights(cons)
         if not weights:
             continue
-        # 只保留有效指标，避免用 None 覆盖已有值
+        # 只保留**有效**指标：既避免用 None 覆盖已有值，也避免把 0 写进去 ——
+        # baostock 对停牌/无数据的指数会给 peTTM/pcfNcfTTM 等填 0，而比率型指标的
+        # 0 是非法值（VALID_RANGE 下限 0.01）。这类 0 会让"绝对值"显示成 0、
+        # 画进估值图、污染分位（分位计算有 _valid 兜底，但**显示没有**）。
         agg = {k: v for k, v in aggregate_metrics(cons, weights).items()
-               if v is not None}
+               if v is not None and _valid(k, v)}
         if not agg:
             continue
         agg["date"] = d
@@ -611,43 +614,31 @@ def index_score(conn, index_code: str, years: int | None = None,
     if not weights:
         weights = equal_weights(codes)
 
-    sum10 = {m: 0.0 for m in METRICS}
-    sum5 = {m: 0.0 for m in METRICS}
-    wsum = {m: 0.0 for m in METRICS}
-    wsum5 = {m: 0.0 for m in METRICS}
-    used = 0
-    for code in codes:
-        w = weights.get(code)
-        if not w:
-            continue
-        # 优先复用成分股**已落库**的分位（个股先算完 → 这里直接读，省掉重算）；
-        # 该日没有存档时才回退到从 kline 现算（例如库还没建过这只的历史分位）。
-        stored = _stored_pcts_asof(conn, code, ref_date)
-        if stored and any(v is not None for v in stored[0].values()):
-            p10, p5 = stored
-        else:
-            p10 = stock_metric_percentiles(conn, code, years, as_of=ref_date)
-            p5 = stock_metric_percentiles(conn, code, years_ref, as_of=ref_date)
-        hit = False
-        for m in METRICS:
-            if p10.get(m) is not None:
-                sum10[m] += w * p10[m]
-                wsum[m] += w
-                hit = True
-            if p5.get(m) is not None:
-                sum5[m] += w * p5[m]
-                wsum5[m] += w
+    # ---------- 分位：用**指数自己的聚合值序列**算，而不是"成分股分位的平均" ----------
+    #
+    # 「平均的分位」≠「分位」：前者是把 300 只成分股各自的分位加权平均，后者是
+    # 先算出指数聚合值（总市值/总盈利…）再看这个值落在自身历史的什么位置。
+    # 主流口径（雪球等）用的是后者。实测两者能差 20+ 个分位点：
+    #   沪深300 PE 46%→63%、PS 53%→78%、PCF 52%→27%、股息率 43%→32%。
+    #
+    # 而且更简单更快：`rebuild_index_valuation` 早就把聚合后的 PE/PB/PS/PCF/股息率
+    # 写进了指数自己的 kline 行，直接对它算滚动分位即可 —— 个股用的是**同一个函数**，
+    # 不必再遍历几百只成分股（原来这一步要 6~9 秒，现在毫秒级）。
+    pcts = stock_metric_percentiles(conn, index_code, years, as_of=ref_date)
+    pcts5 = stock_metric_percentiles(conn, index_code, years_ref, as_of=ref_date)
 
-        used += 1 if hit else 0
-
-    pcts = {m: (sum10[m] / wsum[m]) if wsum[m] > 0 else None for m in METRICS}
-    pcts5 = {m: (sum5[m] / wsum5[m]) if wsum5[m] > 0 else None for m in METRICS}
+    # 成分股覆盖度：只用于邮件/页面的"成分股有效 N/M"完整度提示，不参与分位计算
+    used = conn.execute(
+        f"SELECT count(*) FROM kline WHERE date=? AND code IN ({ph}) AND ("
+        f"pe_ttm IS NOT NULL OR pb_mrq IS NOT NULL OR ps_ttm IS NOT NULL "
+        f"OR pcf_ncf_ttm IS NOT NULL OR div_yield IS NOT NULL)",
+        [ref_date] + codes).fetchone()[0]
 
     # 数据充分性守卫：所有指标都算不出来时，绝不能合成一个"中性 50 分"——
     # 那会变成一封"评分 50 · 正常 · 小额定投"的"一切正常"邮件。
-    if used == 0 or all(v is None for v in pcts.values()):
-        log.warning("%s 成分股无可用的估值数据（%d 只成分股，0 只可用），"
-                    "跳过评分（不落库、不发信）", index_code, len(codes))
+    if all(v is None for v in pcts.values()):
+        log.warning("%s 聚合估值序列无可用的估值数据（%s），跳过评分"
+                    "（不落库、不发信）", index_code, ref_date)
         return None
 
     if has_weights(weights_cfg):
@@ -900,13 +891,11 @@ def rebuild_score_history(conn, code: str, ktype: str = "index",
     target = config.target(code)
     weights_cfg = target["weights"] if target else None
     scored = has_weights(weights_cfg)          # 有权重才合成综合评分
-    if is_agg:
-        codes = storage.load_constituents(conn, code)
-        if not codes:
-            log.warning("%s 无成分股，跳过历史分位重建", code)
-            return 0
-    else:
-        codes = [code]
+    # 分位一律用**标的自己的 kline 序列**算：指数/组合的 kline 里存的**就是**
+    # 成分股聚合后的估值（见 aggregate_metrics），所以和个股走同一条路径即可。
+    # 不再"逐个成分股取分位再加权平均"—— 那是另一个口径，会和当日评分对不上
+    # （当日评分已改成"聚合值自身的历史分位"，见 index_score 的说明）。
+    codes = [code]
 
     # 日期轴：指数用指数K线；个股用自身K线
     axis = [r["date"] for r in storage.load_kline(conn, code, fields=("date",))]
@@ -926,7 +915,7 @@ def rebuild_score_history(conn, code: str, ktype: str = "index",
 
     # 预取采样日的权重（指数按当日市值；组合等权，循环里用常数 1.0 即可，
     # 累加器会按"当日有值的成分股"自行归一）
-    weight_by_date = _weights_by_date(conn, codes, sampled) if is_index else {}
+    weight_by_date: dict = {}          # 已不再按成分股聚合，无需逐日权重
 
     # 累加器：{date: {metric: [加权和, 权重和]}}，10 年与 5 年各一套
     acc10 = {d: {m: [0.0, 0.0] for m in METRICS} for d in sampled}
@@ -934,7 +923,7 @@ def rebuild_score_history(conn, code: str, ktype: str = "index",
     used_by_date = {d: 0 for d in sampled}     # 每个采样日实际用上的成分股数
 
     for c in codes:
-        if reuse_stock_pcts:
+        if reuse_stock_pcts and c != code:
             # 复用个股已落库的分位（全量重建时个股刚算完，指数不必再算一遍）
             p10, p5 = _stored_percentile_series(conn, c)
         else:
