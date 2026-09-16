@@ -10,7 +10,7 @@ data/
 *.db
 *.db-wal
 *.db-shm
-
+.idea/
 # 运行时产物
 logs/
 cron.log
