@@ -10,8 +10,8 @@ from datetime import datetime
 
 from fastapi import HTTPException, Request
 
-from src.config import config
-from src.storage import storage
+from src.infrastructure.config import config
+from src.infrastructure.persistence import storage
 
 log = logging.getLogger("web")
 

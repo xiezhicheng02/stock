@@ -13,9 +13,9 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from src.config import config
-from src.config.defaults import DEFAULT_SETTINGS
-from src.config.defaults import SETTING_GROUPS as _DEFAULT_GROUPS
+from src.infrastructure.config import config
+from src.infrastructure.config.defaults import DEFAULT_SETTINGS
+from src.infrastructure.config.defaults import SETTING_GROUPS as _DEFAULT_GROUPS
 from src.web import deps
 from src.web import scheduler as sched
 

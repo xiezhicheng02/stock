@@ -28,11 +28,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))
 
-from src.config import config            # noqa: E402
+from src.infrastructure.config import config
 from src.fetch_data import data_fetcher  # noqa: E402
 from src.indicators import indicators    # noqa: E402
 from src.notify import mailer, report    # noqa: E402
-from src.storage import storage          # noqa: E402
+from src.infrastructure.persistence import storage
 
 log = logging.getLogger("pipeline")
 

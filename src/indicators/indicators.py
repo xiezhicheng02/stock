@@ -43,8 +43,8 @@ import os
 from collections import deque
 from datetime import date, datetime, timedelta
 
-from src.config import config
-from src.storage import storage
+from src.infrastructure.config import config
+from src.infrastructure.persistence import storage
 
 log = logging.getLogger("indicators")
 
@@ -863,7 +863,7 @@ def _stored_pcts_asof(conn, code: str, ref_date: str):
     """
     fields = (("date",) + tuple(_PCT_COL.values()) + tuple(_PCT5_COL.values()))
     rows = storage.load_scores(conn, code, start=ref_date, end=ref_date,
-                              fields=fields)
+                               fields=fields)
     if not rows:
         return None
     r = rows[-1]

@@ -10,9 +10,9 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from src.config import config
+from src.infrastructure.config import config
 from src.indicators import indicators
-from src.storage import storage
+from src.infrastructure.persistence import storage
 from src.web import deps
 
 log = logging.getLogger("web.assets")
@@ -65,7 +65,7 @@ def asset_detail(code: str, _: None = Depends(deps.require_auth)):
         b = basics[0] if basics else {}
         sc = storage.latest_score(conn, code)
         krows = storage.load_kline(conn, code, fields=("date",) + METRIC_FIELDS
-                                   + ("close", "pct_chg"))
+                                                      + ("close", "pct_chg"))
         latest_k = krows[-1] if krows else {}
         span = storage.kline_span(conn, code)
         weights = t["weights"] if t else {}

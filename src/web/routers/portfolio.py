@@ -11,10 +11,10 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from src.config import config
+from src.infrastructure.config import config
 from src.indicators import indicators
 from src.notify import pipeline
-from src.storage import storage
+from src.infrastructure.persistence import storage
 from src.web import deps
 
 log = logging.getLogger("web.portfolio")

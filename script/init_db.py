@@ -35,9 +35,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)
 
-from src.config.defaults import (DEFAULT_SETTINGS, TARGET_SPECS,  # noqa: E402
-                                 dump_value, smtp_source_note)
-from src.storage import schema  # noqa: E402
+from src.infrastructure.config.defaults import (DEFAULT_SETTINGS, TARGET_SPECS,  # noqa: E402
+                                                dump_value, smtp_source_note)
+from src.infrastructure.persistence import schema
 
 
 def initialized_version(conn) -> int:

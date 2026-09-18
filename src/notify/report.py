@@ -27,9 +27,9 @@ import logging
 import os
 from datetime import datetime
 
-from src.config import config
+from src.infrastructure.config import config
 from src.show_view import view_show
-from src.storage import storage
+from src.infrastructure.persistence import storage
 
 log = logging.getLogger("report")
 

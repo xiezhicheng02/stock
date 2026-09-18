@@ -18,7 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid
 
-from src.config import config
+from src.infrastructure.config import config
 
 log = logging.getLogger("mailer")
 
