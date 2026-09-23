@@ -36,8 +36,10 @@ K 线统一存前复权价（历史价格已按分红送股调整过），若直
 """
 
 import argparse
+import html
 import logging
 import os
+import re
 import socket
 import sys
 import time
@@ -220,6 +222,24 @@ class BaostockSession:
             out[dst] = None if v == "" else v
         return out
 
+    # ---------------------------------------------------------------
+    # 每日全市场快照（三个批量接口，返回不复权价 adjustflag=3）
+    # ---------------------------------------------------------------
+    def daily_all_astock(self, date):
+        """某日全市场 A股日K。字段含不复权价 + peTTM/pbMRQ/psTTM/pcfNcfTTM。"""
+        return self._call(bs.query_daily_history_k_AStock, date,
+                          what=f"全市场A股 {date}")
+
+    def daily_all_etf(self, date):
+        """某日全部 ETF 日K（只有价格，估值字段为空）。"""
+        return self._call(bs.query_daily_history_k_ETF, date,
+                          what=f"全市场ETF {date}")
+
+    def daily_adjust_factor(self, date):
+        """某日复权因子（事件驱动，只有当天除权除息的股票才有行）。"""
+        return self._call(bs.query_daily_adjust_factor, date,
+                          what=f"复权因子 {date}")
+
     def unadjusted_close(self, code, start, end):
         """未复权收盘价 {date: close}，用于动态股息率计算（不入库）。"""
         rows = self._call(bs.query_history_k_data_plus, code, "date,close",
@@ -307,6 +327,21 @@ class BaostockSession:
 # =====================================================================
 # 工具函数
 # =====================================================================
+def _f(v):
+    """把 baostock 返回的字符串转成 float。
+
+    批量接口（daily_history / adjust_factor）返回的都是字符串，空串表示"无此数据"。
+    统一转成 None，交给 storage 落库时按 NULL 处理。
+    （storage 里也有一个同名私有函数，两边各自独立，别跨模块引用。）
+    """
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _today():
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -368,9 +403,10 @@ def meta_coverage(conn) -> dict:
 
 
 def sync_stock_basics(conn, sess) -> int:
-    """补全 stock_basic 的**行业**与**上市日期**（各一次批量查询全市场）。
+    """补全 stock_basic 的**名称 / 行业 / 上市日期**（各一次批量查询全市场）。
 
-    只是补充字段，用定点 UPDATE（不会覆盖已有的 name/ktype/market）。
+    upsert：已有行定点更新、缺失的行新建（见 storage.upsert_stock_basic_info）。
+    ktype 从 kline 带过来；末尾顺手清掉"没有 kline 数据"的行。
     """
     len_b = len_i = 0
     merged: dict[str, dict] = {}
@@ -379,6 +415,10 @@ def sync_stock_basics(conn, sess) -> int:
         len_b = len(basics)
         for r in basics:
             e = merged.setdefault(r["code"], {"code": r["code"]})
+            # ★ name 必须也取：原来只取 listed_date，导致新插入的 4000+ 只
+            #   个股（以及全部 ETF）在 stock_basic 里有行却没有名称
+            if r.get("name"):
+                e["name"] = r["name"]
             if r.get("listed_date"):
                 e["listed_date"] = r["listed_date"]
     except Exception as e:                          # noqa: BLE001
@@ -393,11 +433,28 @@ def sync_stock_basics(conn, sess) -> int:
     except Exception as e:                          # noqa: BLE001
         log.warning("行业分类拉取失败：%s", e)
 
-    rows = [v for v in merged.values() if len(v) > 1]
-    n = storage.update_stock_basic_info(conn, rows)
-    log.info("标的元信息补充：基本资料 %d 条、行业 %d 条，写入 %d 条",
-             len_b, len_i, n)
-    return n
+    # ktype 必须带上：每日快照会拉进几千只**新**股票，新行没有 ktype 的话
+    # "WHERE ktype='stock'" 这类查询就看不到它（元数据等于白补）。
+    kts = storage.code_ktypes(conn)
+    rows = []
+    for v in merged.values():
+        if len(v) <= 1:
+            continue
+        v.setdefault("ktype", kts.get(v["code"]))
+        rows.append(v)
+    # 关键：upsert（先 UPDATE，命中 0 行才 INSERT）——
+    # 旧的 update_stock_basic_info **只 UPDATE**，新股票没有行就永远补不上。
+    upd, ins = storage.upsert_stock_basic_info(conn, rows)
+    # 顺手清掉"没有 kline 数据"的行（批量接口给的是全市场证券表，含退市股，
+    # 那些 code 查不到 ktype 会落成 NULL，不清就会每次同步新增两千多行垃圾）
+    pruned = storage.prune_stock_basic_without_kline(conn)
+    gaps = storage.kline_meta_gaps(conn)
+    log.info("标的元信息补充：基本资料 %d 条、行业 %d 条 → 更新 %d、新建 %d | "
+             "kline 标的 %d，其中无元数据行 %d、元数据不全 %d",
+             len_b, len_i, upd, ins, gaps["total"], gaps["no_row"],
+             gaps["no_meta"])
+    log.info("已清理无 kline 数据的元数据行：%d 条", pruned)
+    return upd + ins
 
 
 # =====================================================================
@@ -678,6 +735,92 @@ def refetch_for_readjust(conn, sess, codes) -> dict:
     return {"ok": ok, "failed": failed, "total": len(codes)}
 
 
+def sync_market_snapshot(conn, sess, date) -> dict:
+    """当天全市场快照：A股 + ETF → kline（**只落这一天**）。
+
+    这三个批量接口返回的是**不复权**价（adjustflag=3）：
+      * 不复权收盘价 → close_raw
+      * peTTM/pbMRQ/psTTM/pcfNcfTTM → 指数之外的个股估值（选股用）
+      * **前复权 close 不写** —— 接口没给，也绝不覆盖库里已有的值
+        （见 storage.snapshot_rows 的 COALESCE 说明）。
+    """
+    n_a = n_e = 0
+    try:
+        rows = sess.daily_all_astock(date)
+        n_a = _write_snapshot(conn, rows, "stock")
+        log.info("全市场快照 A股：%d 行", n_a)
+    except Exception as e:                              # noqa: BLE001
+        log.error("全市场 A股快照失败：%s", e)
+    try:
+        rows = sess.daily_all_etf(date)
+        n_e = _write_snapshot(conn, rows, "etf")
+        log.info("全市场快照 ETF：%d 行", n_e)
+    except Exception as e:                              # noqa: BLE001
+        log.error("全市场 ETF 快照失败：%s", e)
+    return {"astock": n_a, "etf": n_e}
+
+
+def _write_snapshot(conn, rows, ktype) -> int:
+    """把批量接口的行按 code 分组后落库（storage.snapshot_rows 按 code 写）。"""
+    by_code = {}
+    for r in rows:
+        code = r.get("code")
+        if not code:
+            continue
+        by_code.setdefault(code, []).append({
+            "date": r.get("date"),
+            "open": r.get("open"), "high": r.get("high"), "low": r.get("low"),
+            "close_raw": r.get("close"),          # ← 不复权价进 close_raw
+            "preclose": r.get("preclose"), "volume": r.get("volume"),
+            "amount": r.get("amount"), "turn": r.get("turn"),
+            "pct_chg": r.get("pctChg"), "pe_ttm": r.get("peTTM"),
+            "pb_mrq": r.get("pbMRQ"), "ps_ttm": r.get("psTTM"),
+            "pcf_ncf_ttm": r.get("pcfNcfTTM"), "is_st": r.get("isST"),
+        })
+    n = 0
+    for code, rs in by_code.items():
+        n += storage.snapshot_rows(conn, code, ktype, rs)
+    return n
+
+
+def sync_daily_adjust_factors(conn, sess, date) -> int:
+    """当天复权因子落库（先只存不参与计算）。"""
+    rows = sess.daily_adjust_factor(date)
+    out = [{"code": r.get("code"), "date": r.get("dividOperateDate"),
+            "fore_factor": _f(r.get("foreAdjustFactor")),
+            "back_factor": _f(r.get("backAdjustFactor")),
+            "adjust_factor": _f(r.get("adjustFacto"))} for r in rows]
+    n = storage.upsert_adjust_factors(conn, out)
+    log.info("复权因子 %s：%d 行", date, n)
+    return n
+
+
+def sync_target_history(conn, sess) -> dict:
+    """只给「标的信息」里的 index / stock 补全历史（**组合跳过**）。
+
+    * 指标判据：拿交易日历比对，找出「该有 K 线行却没有」的交易日；
+    * 指数**不拉成分股** —— 指数自己的 K 线就带 peTTM/pbMRQ/psTTM/pcfNcfTTM；
+    * 前复权价只能走 query_history_k_data_plus(adjustflag=2) 逐只拉（批量接口
+      只给不复权价）。
+    """
+    todo = [t for t in config.targets(only_enabled=False)
+            if t["ktype"] in ("index", "stock")]
+    out = {"targets": len(todo), "synced": 0, "failed": []}
+    for t in todo:
+        code = t["code"]
+        try:
+            before = storage.count_kline(conn, code)
+            sync_kline(conn, sess, code, t["ktype"], full=False)
+            after = storage.count_kline(conn, code)
+            out["synced"] += 1
+            log.info("标的 %s(%s) 历史补齐：%d → %d 行",
+                     code, t["ktype"], before, after)
+        except Exception as e:                          # noqa: BLE001
+            log.warning("标的 %s 历史补齐失败：%s", code, e)
+            out["failed"].append(code)
+    return out
+
+
 def ensure_trade_calendar(conn, sess) -> bool:
     """交易日历缺失时补一次（离线判断"最新"的基准）。返回是否补过。
 
@@ -942,188 +1085,212 @@ def sync_dividends(conn, sess, code, full=False):
 #   离线补算（读 close_raw + dividend 表，不再联网）。
 # =====================================================================
 # =====================================================================
+# 指数元数据：来自 baostock **文档**（不是行情接口）
+# ---------------------------------------------------------------------
+# baostock 的 query_stock_basic 只给"代码+简称+上市日"，拿不到指数全称、
+# 类别、发布机构、简介。文档页 dataExplain.md 的「指数数据」章节有 10 张表
+# （综合/规模/一级行业/二级行业/策略/成长/价值/主题/基金/债券），约 560 只指数。
+# 该接口只接受 POST，返回 markdown（表格已是内联 HTML）。
+# 这里只落**元数据**，不碰 kline / valuation_score，因此不影响任何评分。
+# =====================================================================
+INDEX_DOC_URL = "https://www.baostock.com/helpdocs/api/markdown/dataExplain.md"
+INDEX_DOC_SRC = "baostock-doc"          # 写进 stock_basic.meta_src
+
+#: 文档里的章节边界：从「指数数据」到「退市数据」之间
+_IDX_DOC_START = '## <a id="指数数据"'
+_IDX_DOC_END = '### <a id="退市数据"'
+
+_RE_INDEX_TOKEN = re.compile(
+    r'^###\s+<a id="[^"]*"></a>(.+?)\s*$'          # 类别标题（markdown 原样）
+    r'|<table class="index-table">(.*?)</table>',  # 一张指数表
+    re.S | re.M)
+_RE_TR = re.compile(r"<tr>")
+_RE_TD = re.compile(r"<td>(.*?)</td>", re.S)
+_RE_TAG = re.compile(r"<[^>]+>")
+_RE_CODE = re.compile(r"^(?:sh|sz)\.\d{6}$")
+_RE_DATE = re.compile(r"(\d{4})/(\d{1,2})/(\d{1,2})")
+
+
+def fetch_index_doc(url: str = INDEX_DOC_URL, timeout: int = 30) -> str:
+    """下载 baostock 文档正文（该接口只接受 POST，GET 会返回 405）。
+
+    用标准库 urllib 而不是 requests：项目自身的取数层一直不依赖第三方 HTTP 客户端
+    （requests 只是 akshare 的传递依赖），没必要为一次 POST 引入它。
+    """
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, data=b"", method="POST",
+        headers={"User-Agent": "Mozilla/5.0 (index-meta import)",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_index_doc(text: str) -> tuple[list[dict], dict]:
+    """解析「指数数据」章节 → (指数行, 统计)。
+
+    每行：code / name(简称) / full_name / category / publish_date / publisher / intro
+
+    文档里三处已知瑕疵，这里容错处理而不是静默丢数据：
+      * `sz.399237` 那行漏了 `</tr>` → 按 `<tr>` 切分，不配对 `</tr>`；
+      * 发布日期原文错字 `2013/3/20/td>`、`22011/11/15`、`22015/8/31`
+        → 用 `(\\d{4})/(\\d{1,2})/(\\d{1,2})` 抓取并规范成 YYYY-MM-DD；
+      * `sh.000031` 同时出现在「价值指数」和「主题指数」→ 按 code 去重（留首次）。
+    """
+    try:
+        i = text.index(_IDX_DOC_START)
+    except ValueError as e:
+        raise ValueError("文档里找不到「指数数据」章节，baostock 可能改了文档结构") from e
+    j = text.find(_IDX_DOC_END)
+    body = text[i:] if j < 0 else text[i:j]
+
+    rows: list[dict] = []
+    by_cat: dict[str, int] = {}
+    tables = 0
+    dup: list[str] = []
+    bad_date: list[str] = []
+    seen: set[str] = set()
+    category = None
+    for m in _RE_INDEX_TOKEN.finditer(body):
+        if m.group(1):
+            category = m.group(1).strip()
+            by_cat.setdefault(category, 0)
+            continue
+        tables += 1
+        for tr in _RE_TR.split(m.group(2))[1:]:
+            tds = _RE_TD.findall(tr)
+            if len(tds) < 6:
+                continue
+            cells = [html.unescape(_RE_TAG.sub("", t)).strip() for t in tds[:6]]
+            code = cells[0]
+            if not _RE_CODE.match(code):
+                continue
+            if code in seen:                 # 跨表重复（sh.000031）
+                dup.append(code)
+                continue
+            seen.add(code)
+            dm = _RE_DATE.search(cells[3])
+            if not dm:
+                bad_date.append(code)
+                pub = None
+            else:
+                pub = "%s-%02d-%02d" % (dm.group(1), int(dm.group(2)),
+                                        int(dm.group(3)))
+            rows.append({"code": code, "name": cells[1], "full_name": cells[2],
+                         "publish_date": pub, "publisher": cells[4],
+                         "intro": cells[5], "category": category,
+                         "market": code.split(".")[0]})
+            if category:
+                by_cat[category] += 1
+    return rows, {"tables": tables, "categories": by_cat,
+                  "duplicates": dup, "bad_date": bad_date}
+
+
+def sync_index_meta(conn, text: str | None = None) -> dict:
+    """抓取（或使用传入的正文）→ 解析 → 写入 stock_basic，返回统计。
+
+    只写元数据：不碰 kline / valuation_score / valuation_target。
+    """
+    if text is None:
+        text = fetch_index_doc()
+    rows, meta = parse_index_doc(text)
+    r = storage.upsert_index_meta(
+        conn, [dict(x, meta_src=INDEX_DOC_SRC) for x in rows])
+    out = {"total": len(rows), **meta, **r,
+           "stats": storage.index_meta_stats(conn)}
+    log.info("指数元数据：解析 %d 只（%d 张表）→ 新增 %d / 更新 %d，跳过 %d",
+             out["total"], meta["tables"], r["inserted"], r["updated"],
+             len(r["skipped"]))
+    if meta["duplicates"]:
+        log.warning("文档内重复代码（已去重留首次）：%s", meta["duplicates"])
+    if meta["bad_date"]:
+        log.warning("发布日期解析失败：%s", meta["bad_date"])
+    if r["skipped"]:
+        log.warning("代码已被非 index 行占用，跳过：%s",
+                    [(s["code"], s["ktype"]) for s in r["skipped"]])
+    return out
+
+
+# =====================================================================
 # 编排
 # =====================================================================
 def sync_all(conn, mode="auto", limit=None, only=None, only_index=None):
     """完整同步流程（纯取数，不含任何计算）。
 
-    mode       'full' 全量重拉 / 'auto' 增量（默认）
-    limit      只处理前 N 只个股（调试用）
-    only       仅执行某一阶段：trade_date / constituent / kline / dividend / basic
-    only_index 只处理指定指数代码
+    改造后的流程（2026-09 起）：
+      ① 交易日历（含整段重拉，判断"该不该有 K 线"的前提）
+      ② **当天全市场快照**：query_daily_history_k_AStock + _ETF，只落当天
+      ③ **当天复权因子**：query_daily_adjust_factor（先只存不参与计算）
+      ④ **只给标的补历史**：valuation_target 里 ktype ∈ (index, stock)
+         —— 组合跳过；指数**不拉成分股**（指数自己的 K 线就带估值字段）
+
+    mode  'full' 强制全量（透传给每日历/标的补历史）；'auto' 增量。
+    limit / only / only_index 保留形参以兼容旧调用（新流程不再使用）。
     """
     full = (mode == "full")
-    targets = config.targets()
-    if only_index:
-        targets = [t for t in targets if t["code"] == only_index]
-        if not targets:
-            log.error("未找到估值目标：%s", only_index)
-            return
-    batch = int(config.baostock().get("batch_log", 50))
     t0 = time.time()
+    today = _today()
     skipped = []
+    log.info("同步开始（模式 %s，日期 %s）", mode, today)
 
     with BaostockSession() as sess:
-        # ① 交易日历（最便宜，先做；后面各阶段都能用到）
-        if only in (None, "trade_date"):
-            try:
-                sync_trade_dates(conn, sess, full)
-                # 日历没覆盖到 BAOSTOCK_START_DATE 就整段重拉：缺口检测要靠它
-                # 判断"某个历史日期该不该有 K 线"，日历不全就检不出来。
-                ensure_trade_calendar_span(conn, sess)
-            except Exception as e:                            # noqa: BLE001
-                log.error("交易日历同步失败: %s", e)
-                skipped.append(("trade_date", "-", str(e)))
+        # ① 交易日历
+        try:
+            sync_trade_dates(conn, sess, full)
+            ensure_trade_calendar_span(conn, sess)
+        except Exception as e:                            # noqa: BLE001
+            log.error("交易日历同步失败: %s", e)
+            skipped.append(("trade_date", "-", str(e)))
 
-        # ② 大盘指数（上证指数，仅行情展示）：随每日同步增量拉取
-        if only in (None, "kline"):
-            for mcode in MARKET_INDEXES:
-                try:
-                    n = sync_kline(conn, sess, mcode, "index", full)
-                    log.info("大盘指数K线 %s: %d 行", mcode, n)
-                except Exception as e:                        # noqa: BLE001
-                    log.warning("大盘指数 %s 同步失败: %s", mcode, e)
-                    skipped.append(("market", mcode, str(e)))
+        # ② 当天全市场快照（A股 + ETF）
+        try:
+            snap = sync_market_snapshot(conn, sess, today)
+        except Exception as e:                            # noqa: BLE001
+            log.exception("全市场快照失败: %s", e)
+            snap = {"astock": 0, "etf": 0}
+            skipped.append(("snapshot", "-", str(e)))
 
-        # ③ 标的元信息（目标名称/类型）+ 行业/上市日期补全
-        sync_targets(conn, sess, targets)
-        if only in (None, "basic"):
-            try:
-                n_basic = sync_stock_basics(conn, sess)
-                # 校验：补完还缺多少？缺就记进摘要（下次拉取会自动重试，
-                # 因为它每次都会跑），而不是悄悄过去。
-                cov = meta_coverage(conn)
-                if cov["missing_listed"] or cov["missing_industry"]:
-                    msg = (f"仍缺上市日期 {cov['missing_listed']}/{cov['total']}"
-                           f"、行业 {cov['missing_industry']}/{cov['total']}")
-                    log.warning("标的元信息未补全：%s（写回 %d 条，下次拉取重试）",
-                                msg, n_basic)
-                    skipped.append(("basic", "-", msg))
-                else:
-                    log.info("标的元信息完整：%d 只（本次写回 %d 条）",
-                             cov["total"], n_basic)
-            except Exception as e:                        # noqa: BLE001
-                log.warning("标的元信息补全失败：%s", e)
-                skipped.append(("basic", "-", str(e)))
+        # ③ 当天复权因子
+        try:
+            n_factor = sync_daily_adjust_factors(conn, sess, today)
+        except Exception as e:                            # noqa: BLE001
+            log.error("复权因子同步失败: %s", e)
+            n_factor = 0
+            skipped.append(("adjust_factor", "-", str(e)))
 
-        # ④ 指数：成分股 + 指数 K 线；组合：成分股（组合K线由指标层合成）；个股目标：直接拉
-        stock_codes = set()
-        for t in targets:
-            ktype = t["ktype"]
-            if ktype == "portfolio":
-                # 组合没有 baostock 代码：拉它的成分股，组合K线在 indicators 里合成
-                stock_codes.update(storage.load_constituents(conn, t["code"]))
-                continue
-            if ktype != "index":
-                stock_codes.add(t["code"])          # 个股目标
-                continue
-            if only in (None, "constituent"):
-                try:
-                    stock_codes.update(sync_constituents(conn, sess, t))
-                except Exception as e:                        # noqa: BLE001
-                    log.error("%s 成分股同步失败: %s", t["name"], e)
-                    skipped.append(("constituent", t["code"], str(e)))
-            else:
-                stock_codes.update(storage.load_constituents(conn, t["code"]))
-            if only in (None, "kline"):
-                try:
-                    n = sync_kline(conn, sess, t["code"], "index", full)
-                    log.info("指数K线 %s %s: %d 行", t["name"], t["code"], n)
-                except Exception as e:                        # noqa: BLE001
-                    log.error("%s 指数K线同步失败: %s", t["name"], e)
-                    skipped.append(("index_kline", t["code"], str(e)))
+        # ④ 只给标的（index / stock）补历史；组合跳过、指数不拉成分股
+        try:
+            hist = sync_target_history(conn, sess)
+        except Exception as e:                            # noqa: BLE001
+            log.exception("标的补历史失败: %s", e)
+            hist = {"targets": 0, "synced": 0, "failed": []}
+            skipped.append(("target_history", "-", str(e)))
 
-        stocks = sorted(stock_codes)
-        if limit:
-            stocks = stocks[:limit]
-        log.info("待处理个股：%d 只", len(stocks))
+        # ⑤ 元数据（名称/行业/上市日期）—— 只补缺的
+        try:
+            sync_stock_basics(conn, sess)
+        except Exception as e:                            # noqa: BLE001
+            log.warning("标的元信息补全失败：%s", e)
+            skipped.append(("basic", "-", str(e)))
 
-        # ⑤ 个股 K 线（前复权）+ 不复权收盘价（供股息率离线计算）
-        if only in (None, "kline"):
-            for i, code in enumerate(stocks, 1):
-                try:
-                    n = sync_kline(conn, sess, code, "stock", full)
-                    sync_raw_close(conn, sess, code, full)
-                    if i % batch == 0 or n == 0:
-                        log.info("[K线 %d/%d] %s: %d 行", i, len(stocks), code, n)
-                except Exception as e:                        # noqa: BLE001
-                    log.warning("K线 %s 失败: %s", code, e)
-                    skipped.append(("kline", code, str(e)))
-
-        # ⑥ 分红（股息率由「计算指标」任务离线补算）
-        need_refetch = []                    # 有新分红 → 前复权历史变了，需全量重拉
-        if only in (None, "dividend"):
-            for i, code in enumerate(stocks, 1):
-                try:
-                    _, new_div = sync_dividends(conn, sess, code, full)
-                    if new_div:
-                        need_refetch.append(code)
-                    if i % batch == 0:
-                        log.info("[分红 %d/%d] %s", i, len(stocks), code)
-                except Exception as e:                        # noqa: BLE001
-                    log.warning("分红 %s 失败: %s", code, e)
-                    skipped.append(("dividend", code, str(e)))
-
-        # ⑦ 全量重拉 K 线，修正前复权历史（新除权会让整条历史的价格都变）
-        #
-        # 处理两类：
-        #   a) 本次发现新分红的个股；
-        #   b) **上次重拉失败留下的待办** —— 必须单独查，因为分红记录那时已经
-        #      落库了，下一轮 sync_dividends 不会再报"新分红"，
-        #      不查待办的话这次失败就永久静默、该股历史会混着两套复权基准。
-        if only in (None, "kline", "dividend"):
-            pend = storage.readjust_pending_codes(conn)
-            todo = list(dict.fromkeys(list(need_refetch) + sorted(pend)))
-            if todo:
-                log.info("需重拉 K 线修正前复权历史：%d 只（本次新分红 %d + "
-                         "上次失败待重试 %d）", len(todo), len(need_refetch),
-                         len([c for c in todo if c in pend]))
-                r = refetch_for_readjust(conn, sess, todo)
-                if r["failed"]:
-                    skipped.append(("kline_refetch", f"{r['failed']}/{r['total']}",
-                                    "重拉失败，已记为待办下次重试"))
-
-        # ⑧ K 线完整性体检 + 补齐缺口
-        #
-        # 体检判据：每只个股在 [max(上市日期, BAOSTOCK_START_DATE), 最新交易日]
-        # 内，交易日历里该有的交易日是否都有 K 线行。因为**停牌日 baostock 也会
-        # 返回行**（volume=0），所以"缺交易日"= 真缺数据，可以放心补。
-        # 全库 838 只比对只要 ~1s，所以每次拉取都跑；补齐只在真的缺时才做。
-        # 放在最后：它会把命中的股票全历史重拉（并补 close_raw），
-        # 所以必须在其它写 K 线的步骤之后。
-        if only in (None, "kline"):
-            try:
-                gaps = kline_gap_codes(conn)
-                if gaps:
-                    log.info("K线体检：%d 只个股不完整（合计缺 %d 个交易日），开始补齐",
-                             len(gaps), sum(g["missing"] for g in gaps))
-                    fixed = repair_kline_gaps(conn, sess, gaps)
-                    log.info("K线补齐完成：成功 %d，失败 %d",
-                             fixed["fixed"], fixed["failed"])
-                else:
-                    log.info("K线体检：全部个股完整（%d 只）",
-                             storage.count_stocks(conn))
-            except Exception as e:                            # noqa: BLE001
-                log.exception("K线完整性体检/补齐失败：%s", e)
-                skipped.append(("kline_gap", "-", str(e)))
-
-    # ---------- 汇总 ----------
-    log.info("同步完成，耗时 %.1f 分钟", (time.time() - t0) / 60)
     stats = storage.table_stats(conn)
+    log.info("同步完成，耗时 %.1f 分钟 | 快照 A股 %d / ETF %d | 复权因子 %d | "
+             "标的补历史 %d（失败 %d）",
+             (time.time() - t0) / 60, snap["astock"], snap["etf"], n_factor,
+             hist["synced"], len(hist.get("failed") or []))
     log.info("库内统计: kline=%s index_constituent=%s dividend=%s stock_basic=%s trade_date=%s",
              stats.get("kline"), stats.get("index_constituent"),
              stats.get("dividend"), stats.get("stock_basic"), stats.get("trade_date"))
     if skipped:
-        log.warning("跳过 %d 项（可重跑自动续传）:", len(skipped))
-        for kind, code, err in skipped[:20]:
-            log.warning("  [%s] %s -> %s", kind, code, err)
-        if len(skipped) > 20:
-            log.warning("  ... 其余 %d 项略", len(skipped) - 20)
+        log.warning("跳过 %d 项：", len(skipped))
+        for item in skipped:
+            log.warning("  %s", item)
+    return {"ok": not skipped, "snapshot": snap, "adjust_factor": n_factor,
+            "history": hist, "skipped": skipped,
+            "elapsed": round((time.time() - t0) / 60, 2)}
 
-
-# =====================================================================
-# CLI
-# =====================================================================
 def main():
     ap = argparse.ArgumentParser(description="baostock 数据同步")
     ap.add_argument("--full", action="store_true", help="全量重拉（忽略已有进度）")

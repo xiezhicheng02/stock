@@ -6,6 +6,8 @@
 
 const Targets = (function () {
   let root = null, current = null, targetsCache = [];
+  let etfAfter = null, etfDone = false, etfLoading = false;
+  let idxAfter = null, idxDone = false, idxLoading = false, idxCat = '';
   let pendingCode = null;   // 首页告警行点进来时要直接打开的标的
 
   async function mount(el) {
@@ -41,8 +43,97 @@ const Targets = (function () {
       box.append(item);
     });
     box.append(el('button', { class: 'btn block', onclick: createForm }, '＋ 新建组合'));
+
+    // ---- 指数列表：来自 stock_basic 的 560+ 只指数元数据（baostock 文档导入），
+    //      不是 kline —— 这些指数里只有"标的信息"里的少数几只有 K 线。
+    //      按类别筛选 + 游标分页；点进去只浏览（详情里可「添加为标的信息」）。
+    idxAfter = null; idxDone = false; idxCat = '';
+    box.append(el('div', { class: 'side-title' }, '指数'));
+    const idxSel = el('select', { class: 'input side-select', title: '按指数类别筛选' });
+    idxSel.append(el('option', { value: '' }, '全部类别'));
+    const idxHolder = el('div', { id: 'tg-idx' });
+    const idxBtn = el('button', { class: 'btn block', onclick: () => loadIndexes(idxHolder, idxBtn, idxSel) },
+      '加载更多指数');
+    idxSel.addEventListener('change', () => {
+      idxCat = idxSel.value; idxAfter = null; idxDone = false;
+      idxHolder.innerHTML = '';
+      loadIndexes(idxHolder, idxBtn, idxSel);
+    });
+    box.append(idxSel, idxHolder, idxBtn);
+    loadIndexes(idxHolder, idxBtn, idxSel);   // 首屏自动带出前 60 只
+
+    // ---- ETF 列表：每日全市场快照会落 1600+ 只，用游标分页 + 手动"加载更多"
+    //      （一次渲染 1600 行会卡）。点进去复用同一套详情渲染：
+    //      ETF 没有前复权 close / 没有 PE-PB，后端已让 K 线回退用 close_raw。
+    etfAfter = null; etfDone = false;
+    box.append(el('div', { class: 'side-title' }, 'ETF'));
+    const etfHolder = el('div', { id: 'tg-etf' });
+    const etfBtn = el('button', { class: 'btn block', onclick: () => loadEtfs(etfHolder, etfBtn) },
+      '加载更多 ETF');
+    box.append(etfHolder, etfBtn);
+    loadEtfs(etfHolder, etfBtn);   // 首屏自动带出前 60 只，其余点"加载更多"（不 await，不挡页面）
     // 默认展示第一个指数/组合
     if (!current && targetsCache.length) await select(targetsCache[0].code);
+  }
+
+  function indexItem(t) {
+    const item = el('div', { class: 'side-item' + (current === t.code ? ' active' : ''),
+      onclick: () => select(t.code) });
+    item.append(el('div', { class: 'side-name' }, t.name || t.code));
+    item.append(el('div', { class: 'side-code' },
+      t.code + (t.category ? ' · ' + t.category : '')));
+    return item;
+  }
+
+  async function loadIndexes(holder, btn, sel) {
+    if (idxLoading || idxDone) return;
+    idxLoading = true;
+    const old = btn.textContent;
+    btn.textContent = '加载中…';
+    try {
+      const d = await api(API.indexes(idxAfter, 60, idxCat));
+      if (sel && !sel.dataset.filled) {     // 类别下拉只填一次
+        (d.categories || []).forEach((c) => sel.append(el('option', { value: c }, c)));
+        sel.dataset.filled = '1';
+      }
+      (d.items || []).forEach((t) => holder.append(indexItem(t)));
+      idxAfter = d.next_after;
+      idxDone = !d.has_more;
+      btn.textContent = idxDone ? '（指数已全部加载）' : '加载更多指数';
+    } catch (e) {
+      showToast(e.message, false);
+      btn.textContent = old;
+    } finally {
+      idxLoading = false;
+    }
+  }
+
+  function etfItem(t) {
+    const item = el('div', { class: 'side-item' + (current === t.code ? ' active' : ''),
+      onclick: () => select(t.code) });
+    item.append(el('div', { class: 'side-name' },
+      el('span', { class: 'tag off' }, 'ETF'), ' ' + (t.name || t.code)));
+    item.append(el('div', { class: 'side-code' }, t.code));
+    return item;
+  }
+
+  async function loadEtfs(holder, btn) {
+    if (etfLoading || etfDone) return;
+    etfLoading = true;
+    const old = btn.textContent;
+    btn.textContent = '加载中…';
+    try {
+      const d = await api(API.etfs(etfAfter, 60));
+      (d.items || []).forEach((t) => holder.append(etfItem(t)));
+      etfAfter = d.next_after;
+      etfDone = !d.has_more;
+      btn.textContent = etfDone ? '（ETF 已全部加载）' : '加载更多 ETF';
+    } catch (e) {
+      showToast(e.message, false);
+      btn.textContent = old;
+    } finally {
+      etfLoading = false;
+    }
   }
 
   function createForm() {
@@ -184,6 +275,24 @@ const Targets = (function () {
 
   // 与「标的信息 / 个股管理」共用同一套详情布局（AssetView）
   function render(dom, code, d, c, s, k, p) {
+    // ETF 只做浏览：它不在 valuation_target 里，「拉取数据 / 立即计算评分 / 成分股」
+    // 都没有意义，全部不给按钮（点错只会报错）。
+    if (d.ktype === 'etf') {
+      AssetView.render(dom, d, k.items || [], s.items || [], (p && p.metrics) || {}, {
+        weights: 'readonly',
+      });
+      return;
+    }
+    // 普通指数（还没加入标的信息）：只浏览 + 元数据。
+    // 「拉取数据 / 立即计算评分」都要求它在 valuation_target 里（否则 404），
+    // 所以不给按钮；要加入就点权重卡右上角的「添加为标的信息」。
+    if (d.ktype === 'index' && !d.is_target) {
+      AssetView.render(dom, d, k.items || [], s.items || [], (p && p.metrics) || {}, {
+        weights: 'edit', weightsCode: code,
+        onWeightsSaved: () => select(code),
+      });
+      return;
+    }
     const actions = [
       { label: '拉取数据', cls: 'btn', onClick: (ev) => syncData(code, ev) },
     ];

@@ -18,8 +18,12 @@ const AssetView = (function () {
   }
 
   function ktypeLabel(kt) {
-    return kt === 'index' ? '指数' : kt === 'portfolio' ? '组合' : '个股';
+    return kt === 'index' ? '指数' : kt === 'portfolio' ? '组合'
+      : kt === 'etf' ? 'ETF' : '个股';
   }
+
+  // 指数那一列存的是**发布日期**（沿用改动前 3 行指数的口径），个股是上市日期
+  function dateLabel(kt) { return kt === 'index' ? '发布' : '上市'; }
 
   // 卡片标题 + 右侧"当前值"小标签（走势图标题里带最新值用）
   function ctitle(text, chips) {
@@ -111,7 +115,7 @@ const AssetView = (function () {
         d.code + ' · ' + ktypeLabel(d.ktype)
         + (d.constituent_count != null ? ' · ' + d.constituent_count + ' 只成分股' : '')
         + (d.industry ? ' · ' + d.industry : '')
-        + (d.listed_date ? ' · 上市 ' + d.listed_date : ''))));
+        + (d.listed_date ? ' · ' + dateLabel(d.ktype) + ' ' + d.listed_date : ''))));
     const right = el('div', { class: 'asset-head-r' });
     if (scored) {
       right.append(el('div', { class: 'asset-score' }, fmt(sc.score, 1) + '%'));
@@ -119,8 +123,10 @@ const AssetView = (function () {
       if (delta) right.append(delta);
     } else {
       // 没配置权重 → 不算综合评分，这里也不显示
-      right.append(el('div', { class: 'asset-noscore' }, '未配置评分权重'));
-      right.append(el('div', { class: 'asset-status' }, '仅展示估值分位'));
+      right.append(el('div', { class: 'asset-noscore' },
+        d.ktype === 'etf' ? '无估值数据' : '未配置评分权重'));
+      right.append(el('div', { class: 'asset-status' },
+        d.ktype === 'etf' ? '仅展示 K 线' : '仅展示估值分位'));
     }
     head.append(right);
 
@@ -129,6 +135,11 @@ const AssetView = (function () {
 
     // ---- 基本信息（操作按钮放卡片右上角）----
     if (opts.info !== false) dom.append(basicInfoCard(d, opts));
+
+    // ---- 指数资料（文档导入的元数据：全称/类别/发布机构/简介）----
+    if (d.ktype === 'index' && (d.full_name || d.category || d.intro)) {
+      dom.append(indexInfoCard(d));
+    }
 
     // ---- 指标与权重（合并卡片：权重堆叠条 + 五指标卡）----
     if (opts.weights) dom.append(metricsWeightsCard(d, pcts, opts));
@@ -145,10 +156,17 @@ const AssetView = (function () {
       }
       if (kLast.date) kChips.push(valChip(kLast.date, 'muted'));
     }
-    dom.append(el('div', { class: 'card' },
-      ctitle('K线走势', kChips),
-      el('div', { class: 'chart', id: 'av-kline', style: 'height:360px' })));
-    if (kline.length) chartInst.kline = charts.kline($('av-kline'), kline);
+    if (kline.length) {
+      dom.append(el('div', { class: 'card' },
+        ctitle('K线走势', kChips),
+        el('div', { class: 'chart', id: 'av-kline', style: 'height:360px' })));
+      chartInst.kline = charts.kline($('av-kline'), kline);
+    } else {
+      // 没有行情就别画一张空图（文档导入的 560+ 只指数、刚进来的新股票都还没 K 线）
+      dom.append(el('div', { class: 'card' },
+        ctitle('K线走势'),
+        el('div', { class: 'muted pad' }, '暂无 K 线数据（还没拉取过该标的的行情）')));
+    }
 
     // ---- 综合评分走势（仅"有评分"的标的；标题带最新评分）----
     const scoredRows = (score || []).filter((r) => r.score != null);
@@ -173,8 +191,35 @@ const AssetView = (function () {
       chartInst.score = charts.scoreTrend($('av-score'), scoredRows);
     }
 
-    // ---- 5 个指标分位走势 ----
-    Object.assign(chartInst, metricPctCharts(dom, pcts));
+    // ---- 5 个指标分位走势（一条数据都没有时整组不画，否则是 5 张空图）----
+    if (Object.values(pcts).some((s) => s && s.length)) {
+      Object.assign(chartInst, metricPctCharts(dom, pcts));
+    }
+  }
+
+  // 指数资料卡：baostock 文档导入的全称/类别/发布机构/简介（个股没有这些字段）
+  function indexInfoCard(d) {
+    const card = el('div', { class: 'card' });
+    card.append(ctitle('指数资料', [
+      d.category ? valChip(d.category, 'muted') : null,
+      d.publisher ? valChip(d.publisher, 'muted') : null,
+    ]));
+    const sum = el('div', { class: 'info-grid cols-3' });
+    const cells = [
+      { label: '指数全称', value: d.full_name },
+      { label: '指数类别', value: d.category },
+      { label: '发布机构', value: d.publisher },
+    ];
+    cells.forEach((c) => {
+      const blank = c.value === null || c.value === undefined || c.value === '';
+      sum.append(el('div', { class: 'info-cell' + (blank ? ' is-blank' : '') },
+        el('span', { class: 'ik' }, c.label),
+        el('span', { class: 'iv' + (blank ? ' empty' : '') }, blank ? '—' : c.value),
+        el('span', { class: 'iv-sub muted' })));
+    });
+    card.append(sum);
+    if (d.intro) card.append(el('div', { class: 'index-intro' }, d.intro));
+    return card;
   }
 
   // 基本信息卡片：左标题 + 右上角操作按钮 + **固定两行** 键值网格（每行 5 格）
@@ -210,7 +255,7 @@ const AssetView = (function () {
           ? el('span', { class: 'iv-sub muted' }, d.constituent_count + ' 只成分股') : null },
       { label: '市场', value: d.market_label || d.market },
       { label: '行业', value: d.industry },
-      { label: '上市日期', value: d.listed_date },
+      { label: d.ktype === 'index' ? '发布日期' : '上市日期', value: d.listed_date },
 
       // ---------- 第二行：最新数据 ----------
       { label: '最新收盘', value: k.close != null ? fmt(k.close, 2) : null,
@@ -225,10 +270,12 @@ const AssetView = (function () {
           : null,
         sub: sc.score5 != null
           ? el('span', { class: 'iv-sub muted' }, '5年 ' + fmt(sc.score5, 1) + '%') : null },
-      { label: '评分权重', value: d.is_target ? '已配置' : '未配置',
-        tone: d.is_target ? 'ok' : 'warn',
+      { label: '评分权重',
+        value: d.ktype === 'etf' ? '不适用' : (d.is_target ? '已配置' : '未配置'),
+        tone: d.ktype === 'etf' ? null : (d.is_target ? 'ok' : 'warn'),
         sub: el('span', { class: 'iv-sub muted' },
-          sumW > 0 ? '合计 ' + sumW + '%' : '未设置比例') },
+          d.ktype === 'etf' ? 'ETF 无估值指标'
+            : (sumW > 0 ? '合计 ' + sumW + '%' : '未设置比例')) },
       { label: '分位偏离',
         value: div
           ? el('span', { class: div.over ? 'iv-alert' : '' },
@@ -333,6 +380,18 @@ const AssetView = (function () {
   // opts.onWeightsSaved / opts.onTargetRemoved
   function metricsWeightsCard(d, pcts, opts) {
     opts = opts || {};
+    // ETF：行情快照只落不复权收盘价，没有 PE/PB/PS/PCF/股息率，也不参与综合评分。
+    // 这里不给指标卡（否则五张卡全是"—"、还挂着"添加为标的信息"按钮，误导），
+    // 只说明一句；K 线照常展示（后端已让 ETF 的 close 回退到 close_raw）。
+    if (d.ktype === 'etf') {
+      const card = el('div', { class: 'card mw-card' });
+      card.append(el('div', { class: 'section-head' },
+        el('h3', { class: 'card-title', style: 'margin:0' }, '指标与权重')));
+      card.append(el('div', { class: 'muted small' },
+        'ETF 无估值数据（市值/盈利口径不适用），不计算 PE/PB/PS/PCF 与股息率分位，'
+        + '也不参与综合评分；本页仅展示 K 线走势，供浏览用。'));
+      return card;
+    }
     const code = opts.weightsCode || d.code;
     const w = d.weights || {};
     const configured = !!d.is_target && WEIGHT_KEYS.some((k) => (w[k] || 0) > 0);

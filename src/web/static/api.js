@@ -33,6 +33,13 @@ const API = {
   marketSync: '/api/market/sync',
   stocks: (after, limit) => '/api/stocks?limit=' + (limit || 60)
     + (after ? '&after=' + encodeURIComponent(after) : ''),
+  // ETF 清单（每日全市场快照落 1600+ 只，游标分页）
+  etfs: (after, limit) => '/api/etfs?limit=' + (limit || 60)
+    + (after ? '&after=' + encodeURIComponent(after) : ''),
+  // 指数清单（stock_basic 里的指数元数据，560+ 只；可按类别筛选，游标分页）
+  indexes: (after, limit, category) => '/api/indexes?limit=' + (limit || 60)
+    + (after ? '&after=' + encodeURIComponent(after) : '')
+    + (category ? '&category=' + encodeURIComponent(category) : ''),
   syncStock: (c) => '/api/stock/' + encodeURIComponent(c) + '/sync',
   syncTarget: (c) => '/api/target/' + encodeURIComponent(c) + '/sync',
   targetScore: (c) => '/api/target/' + encodeURIComponent(c) + '/score',

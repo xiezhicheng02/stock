@@ -47,7 +47,9 @@ def _refresh_target(conn, code: str, ktype: str, full: bool = False) -> dict | N
                 return pipeline.rebuild_portfolio(conn, code)
             indicators.portfolio_score(conn, code)
         elif ktype == "index":
-            indicators.rebuild_index_valuation(conn, code, only_missing=True)
+            # 指数估值优先用指数K线自带的字段；只有确实没有时才聚合兜底
+            if indicators.index_valuation_missing(conn, code):
+                indicators.rebuild_index_valuation(conn, code, only_missing=True)
             indicators.index_score(conn, code)
         else:
             indicators.stock_score(conn, code)

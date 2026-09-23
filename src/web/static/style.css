@@ -436,6 +436,9 @@ table.data.clickable tbody tr:hover .row-link { color: var(--accent); text-decor
   gap: 1px; background: var(--line);
   border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
 }
+/* 只有 3/4 格的场景（指数资料：全称/类别/发布机构）—— 不留空格子 */
+.info-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.info-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .info-cell {
   background: #fff; padding: 10px 14px 11px; min-width: 0;
   display: flex; flex-direction: column; gap: 1px;
@@ -588,6 +591,13 @@ table.data tbody tr:hover { background: #fafbfd; }
 .struct { margin-bottom: 4px; }
 .struct table.data td { padding: 6px 8px; }
 .input.mini { width: 90px; }
+/* 「指数与组合」侧栏：指数类别下拉（占满侧栏宽度，和下面的列表对齐） */
+.side-select { width: 100%; margin: 0 0 6px; font-size: 12px; padding: 6px 8px; }
+/* 指数资料卡的简介段落（指数简介都比较长，单独一段，和上面的键值格分开） */
+.index-intro {
+  margin: 10px 2px 0; padding-top: 10px; border-top: 1px solid var(--line);
+  font-size: 12px; line-height: 1.75; color: var(--muted);
+}
 input.color { width: 44px; height: 30px; border: 1px solid #d5dae4; border-radius: 6px; padding: 2px; background: #fff; cursor: pointer; }
 .check-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px; margin: 6px 0 8px; }
 .check-item { display: flex; align-items: center; gap: 5px; font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }

@@ -225,6 +225,23 @@ def aggregate_metrics(rows, weights, min_coverage: float = MIN_COVERAGE) -> dict
     return out
 
 
+def index_valuation_missing(conn, code: str) -> bool:
+    """指数 K 线是否**缺自带估值字段** —— 只有缺才需要成分股聚合兜底。
+
+    指数已不再拉成分股：估值优先用 baostock 指数 K 线自带的
+    peTTM/pbMRQ/psTTM/pcfNcfTTM（sync_kline 已落库）。这里判一下"四个字段
+    是否全空"，全空才回退到旧的成分股聚合，避免万一 baostock 不提供时指数
+    估值彻底停更。
+    """
+    row = conn.execute(
+        "SELECT pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm FROM kline "
+        "WHERE code=? AND ktype='index' ORDER BY date DESC LIMIT 1",
+        (code,)).fetchone()
+    if not row:
+        return True
+    return all(row[i] is None for i in range(4))
+
+
 def rebuild_index_valuation(conn, index_code: str, start: str | None = None,
                             end: str | None = None, batch: int = 500,
                             only_missing: bool = False,
@@ -597,10 +614,9 @@ def index_score(conn, index_code: str, years: int | None = None,
     target = config.target(index_code)
     weights_cfg = target["weights"] if target else None
     name = target["name"] if target else storage.stock_name(conn, index_code)
-    codes = storage.load_constituents(conn, index_code)
-    if not codes:
-        log.warning("%s 无成分股，跳过评分", index_code)
-        return None
+    # 指数**不再要求成分股**：估值与分位都来自指数自己的 K 线
+    # （baostock 的指数 K 线带 peTTM/pbMRQ/psTTM/pcfNcfTTM），
+    # 所以新加的指数即使一只成分股都没有，也能正常算分。
 
     if ref_date is None:
         ref_date = (storage.latest_kline_date(conn, index_code)
@@ -628,11 +644,7 @@ def index_score(conn, index_code: str, years: int | None = None,
     pcts5 = stock_metric_percentiles(conn, index_code, years_ref, as_of=ref_date)
 
     # 成分股覆盖度：只用于邮件/页面的"成分股有效 N/M"完整度提示，不参与分位计算
-    used = conn.execute(
-        f"SELECT count(*) FROM kline WHERE date=? AND code IN ({ph}) AND ("
-        f"pe_ttm IS NOT NULL OR pb_mrq IS NOT NULL OR ps_ttm IS NOT NULL "
-        f"OR pcf_ncf_ttm IS NOT NULL OR div_yield IS NOT NULL)",
-        [ref_date] + codes).fetchone()[0]
+    used = 0        # 不再统计成分股覆盖度（指数估值来自自身 K 线）
 
     # 数据充分性守卫：所有指标都算不出来时，绝不能合成一个"中性 50 分"——
     # 那会变成一封"评分 50 · 正常 · 小额定投"的"一切正常"邮件。
@@ -1334,7 +1346,9 @@ def compute_target(conn, code: str, ktype: str, full: bool = False) -> dict:
     if ktype == "index":
         out["dividend_yield_filled"] = fill_dividend_yields(
             conn, storage.load_constituents(conn, code))
-        rebuild_index_valuation(conn, code, only_missing=not full)
+        # 指数估值优先用自带字段；只有确实没有时才回退聚合（见函数说明）
+        if index_valuation_missing(conn, code):
+            rebuild_index_valuation(conn, code, only_missing=not full)
         r = index_score(conn, code)
     elif ktype == "portfolio":
         out["dividend_yield_filled"] = fill_dividend_yields(
@@ -1537,7 +1551,7 @@ def compute_all(conn, save_score: bool = True, rebuild_valuation: bool = True,
         for t in config.targets():
             if t["ktype"] == "index":
                 try:
-                    rebuild_index_valuation(conn, t["code"], only_missing=True)
+                    pass  # 指数不再聚合成分股：改用 baostock 指数K线自带的估值字段
                 except Exception as e:              # noqa: BLE001
                     log.warning("%s 指数估值聚合失败：%s", t["code"], e)
 
@@ -1592,7 +1606,8 @@ def run(conn, rebuild_valuation: bool = True, save_score: bool = True,
         try:
             r = None
             if ktype == "index":
-                if rebuild_valuation:
+                # 同上：自带估值字段就用自带的，缺了才聚合兜底
+                if rebuild_valuation and index_valuation_missing(conn, code):
                     rebuild_index_valuation(conn, code, only_missing=True)
                 if history_freq:
                     rebuild_score_history(conn, code, ktype, freq=history_freq)

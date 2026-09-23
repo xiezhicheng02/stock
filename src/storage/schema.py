@@ -27,7 +27,10 @@
 #   7 → 新增 mail_body（已发送邮件的自包含正文快照，供首页点击回看）；
 #       mail_log 新增 body_key（指向 mail_body）
 #   8 → 新增 pending_image（暂存邮件的内联图片，否则定时发送时图表全是破图）
-SCHEMA_VERSION = 8
+#   9 → 新增 adjust_factor（复权因子，每日全市场快照顺带落库）
+#  10 → stock_basic 新增 full_name/category/publisher/intro/meta_src
+#       （指数元数据，来自 baostock 文档 dataExplain.md 的「指数数据」10 张表）
+SCHEMA_VERSION = 10
 
 DDL = """
 -- ① K 线表（个股 + 指数共用）
@@ -84,11 +87,16 @@ CREATE INDEX IF NOT EXISTS idx_div_date ON dividend(code, ex_date);
 -- ④ 标的元信息
 CREATE TABLE IF NOT EXISTS stock_basic (
     code        TEXT    PRIMARY KEY,       -- sh.600000 / sh.000300
-    name        TEXT,                      -- 名称（浦发银行 / 沪深300）
-    ktype       TEXT,                      -- stock / index
+    name        TEXT,                      -- 名称（浦发银行 / 沪深300 简称）
+    ktype       TEXT,                      -- stock / index / etf / portfolio
     market      TEXT,                      -- sh / sz
     industry    TEXT,                      -- 所属行业（个股）
-    listed_date TEXT,                      -- 上市日期
+    listed_date TEXT,                      -- 个股=上市日期；指数=发布日期（口径同已有指数行）
+    full_name   TEXT,                      -- 指数全称（个股为 NULL）
+    category    TEXT,                      -- 指数类别：综合指数/规模指数/一级行业指数/...
+    publisher   TEXT,                      -- 指数发布机构
+    intro       TEXT,                      -- 指数简介
+    meta_src    TEXT,                      -- 元数据来源标记（如 baostock-doc），便于区分来源
     updated_at  TEXT
 );
 
@@ -219,6 +227,19 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at  TEXT,
     description TEXT
 );
+
+-- 复权因子（事件驱动：只有当天除权除息的股票才有行）
+-- baostock query_daily_adjust_factor 的原始落地，先只存不参与计算（价格口径不变）。
+CREATE TABLE IF NOT EXISTS adjust_factor (
+    code            TEXT NOT NULL,          -- sh.600000
+    date            TEXT NOT NULL,          -- 除权除息日 YYYY-MM-DD
+    fore_factor     REAL,                   -- foreAdjustFactor  前复权因子
+    back_factor     REAL,                   -- backAdjustFactor 后复权因子
+    adjust_factor   REAL,                   -- adjustFactor
+    created_at      TEXT,
+    PRIMARY KEY (code, date)
+);
+
 """
 
 # 依赖的标的与默认配置会在 script/init_db.py 中写入初始数据；
@@ -249,6 +270,14 @@ MIGRATION_COLUMNS = {
     },
     "mail_log": {
         "body_key": "TEXT",           # 7：指向 mail_body（已发送邮件的正文快照）
+    },
+    "stock_basic": {
+        # 10：指数元数据（baostock 文档 dataExplain.md「指数数据」10 张表）
+        "full_name": "TEXT",          # 指数全称
+        "category": "TEXT",           # 指数类别（综合指数/规模指数/…）
+        "publisher": "TEXT",          # 发布机构
+        "intro": "TEXT",              # 指数简介
+        "meta_src": "TEXT",           # 元数据来源标记（baostock-doc）
     },
 }
 

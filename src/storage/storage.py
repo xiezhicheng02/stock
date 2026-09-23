@@ -394,6 +394,62 @@ def load_dividends(conn, code: str, since: str | None = None) -> list[dict]:
 
 
 # =====================================================================
+# 复权因子（adjust_factor 表）—— 事件驱动，先只存不参与计算
+# =====================================================================
+def upsert_adjust_factors(conn, rows_, batch: int = 500) -> int:
+    """写入复权因子 rows: [{code,date,fore_factor,back_factor,adjust_factor}]。"""
+    now = _now()
+    payload = [(r.get("code"), r.get("date"), r.get("fore_factor"),
+                r.get("back_factor"), r.get("adjust_factor"), now)
+               for r in rows_ if r.get("code") and r.get("date")]
+    if not payload:
+        return 0
+    sql = ("INSERT OR REPLACE INTO adjust_factor"
+           "(code,date,fore_factor,back_factor,adjust_factor,created_at) "
+           "VALUES(?,?,?,?,?,?)")
+    for i in range(0, len(payload), batch):
+        conn.executemany(sql, payload[i:i + batch])
+        conn.commit()
+    return len(payload)
+
+
+def snapshot_rows(conn, code: str, ktype: str, rows_, batch: int = 800) -> int:
+    """全市场日快照落库：**只补 close_raw 与估值字段，绝不覆盖已有 close（前复权）**。
+
+    为什么不能直接用 upsert_kline（INSERT OR REPLACE）：那是"先删再插"，
+    快照里没有前复权 close 这一列，会把库里已经算好的前复权价抹成 NULL。
+    这里用 UPSERT + COALESCE：新值为 NULL 时保留原值 —— 于是
+      * 新上市的股票：插入一行（close 为空，等它成为标的时再补前复权）；
+      * 已有行：只更新 close_raw / 估值 / 量额等，**close 原样不动**。
+    """
+    now_fields = ("open", "high", "low", "close", "close_raw", "preclose",
+                  "volume", "amount", "turn", "pct_chg", "pe_ttm", "pb_mrq",
+                  "ps_ttm", "pcf_ncf_ttm", "div_yield", "is_st")
+    payload = []
+    for r in rows_:
+        d = r.get("date")
+        if not d:
+            continue
+        vals = tuple(_i(r.get(f)) if f == "is_st" else _f(r.get(f))
+                     for f in now_fields)
+        payload.append((code, d, ktype) + vals)
+    if not payload:
+        return 0
+    cols = ",".join(("code", "date", "ktype") + now_fields)
+    ph = ",".join("?" * (3 + len(now_fields)))
+    # close 故意不在 SET 里：快照没有前复权价，不能覆盖
+    sets = ",".join(
+        f"{f}=COALESCE(excluded.{f}, kline.{f})"
+        for f in now_fields if f != "close")
+    sql = (f"INSERT INTO kline({cols}) VALUES({ph}) "
+           f"ON CONFLICT(code,date) DO UPDATE SET {sets}")
+    for i in range(0, len(payload), batch):
+        conn.executemany(sql, payload[i:i + batch])
+        conn.commit()
+    return len(payload)
+
+
+# =====================================================================
 # 标的元信息（stock_basic 表）
 # =====================================================================
 def upsert_stock_basic(conn, rows) -> int:
@@ -425,6 +481,88 @@ def upsert_stock_basic(conn, rows) -> int:
         payload)
     conn.commit()
     return len(payload)
+
+
+def upsert_stock_basic_info(conn, rows_, batch: int = 300) -> tuple:
+    """补元数据：**已有行定点更新、没有的行才新建**。返回 (更新, 新建)。
+
+    为什么不能只用 update_stock_basic_info：它**只 UPDATE**。而每日全市场快照
+    一次会拉进 5000+ 只新股票，它们连 stock_basic 的行都不存在，UPDATE 命中 0 行
+    —— 实测 kline 有 5220 只个股、stock_basic 只有 856 只，4365 只永远补不上元数据。
+
+    这里先 UPDATE（命中就改，不覆盖已有值之外的东西），rowcount=0 才 INSERT。
+    ktype 由调用方从 kline 带过来（新行没有 ktype 的话，"WHERE ktype='stock'"
+    这类查询会看不到它）。
+    """
+    now = _now()
+    upd = ins = 0
+    fields_order = ("name", "ktype", "market", "industry", "listed_date")
+    for i, r in enumerate(rows_, 1):
+        code = r.get("code")
+        if not code:
+            continue
+        f = {k: r.get(k) for k in fields_order
+             if r.get(k) not in (None, "")}
+        if not f:
+            continue
+        sets = ",".join(f"{k}=?" for k in f)
+        cur = conn.execute(
+            f"UPDATE stock_basic SET {sets}, updated_at=? WHERE code=?",
+            list(f.values()) + [now, code])
+        if cur.rowcount == 0:
+            cols = ",".join(f)
+            ph = ",".join("?" * len(f))
+            conn.execute(
+                f"INSERT OR IGNORE INTO stock_basic(code,{cols},updated_at) "
+                f"VALUES(?,{ph},?)", [code] + list(f.values()) + [now])
+            ins += 1
+        else:
+            upd += 1
+        if i % batch == 0:
+            conn.commit()
+    conn.commit()
+    return upd, ins
+
+
+def prune_stock_basic_without_kline(conn) -> int:
+    """删掉 stock_basic 里**没有 kline 数据**的行（ktype IS NULL）。
+
+    为什么会有这种行：`sync_stock_basics` 批量拉的是 baostock 的**全市场证券表**
+    （约 9000 条，含退市股/B股），而我们只跟踪 kline 里有的那些。`code_ktypes()`
+    查不到它们 → ktype 落成 NULL → 每次同步都会新增两千多行垃圾。
+
+    stock_basic 的语义是"**我们有数据的标的**的元信息"，不是全市场证券主数据，
+    所以在同步末尾顺手清掉。返回删除行数。
+    """
+    cur = conn.execute("DELETE FROM stock_basic WHERE ktype IS NULL")
+    conn.commit()
+    return cur.rowcount
+
+
+def kline_meta_gaps(conn, ktype: str | None = None) -> dict:
+    """体检：kline 里有、但 stock_basic 里没有（或元数据不全）的标的。
+
+    "元数据不全"**只统计 ktype='stock'**：ETF / 指数 / 组合本来就没有行业
+    （行业分类接口不覆盖它们），把它们算进来会让这个数字虚高、失去参考价值
+    （实测把 1667 只 ETF 全算进去了，6039 里一大半是假的）。
+    同时按字段拆开报，便于定位到底缺什么。
+    """
+    cond = "WHERE ktype=?" if ktype else ""
+    params = (ktype,) if ktype else ()
+    total = conn.execute(
+        f"SELECT count(DISTINCT code) FROM kline {cond}", params).fetchone()[0]
+    no_row = conn.execute(
+        f"SELECT count(*) FROM (SELECT DISTINCT code FROM kline {cond}) "
+        f"WHERE code NOT IN (SELECT code FROM stock_basic)", params).fetchone()[0]
+    miss = {}
+    for col in ("name", "industry", "listed_date"):
+        miss[col] = conn.execute(
+            "SELECT count(*) FROM stock_basic WHERE ktype='stock' "
+            f"AND ({col} IS NULL OR trim({col})='')").fetchone()[0]
+    return {"total": total, "no_row": no_row,
+            "no_meta": sum(1 for v in miss.values() if v),
+            "missing": miss}
+
 
 
 def load_stock_basic(conn, code: str | None = None, ktype: str | None = None) -> list[dict]:
@@ -730,14 +868,17 @@ def search_stocks(conn, q: str, limit: int = 20) -> list[dict]:
     return out
 
 
-def list_stocks(conn, limit: int = 60, after: str | None = None) -> list[dict]:
-    """列出"有个股K线"的个股清单（个股管理页侧栏，游标分页），附最新K线日期。
+def list_stocks(conn, limit: int = 60, after: str | None = None,
+                ktype: str = "stock") -> list[dict]:
+    """列出某类型（默认个股）的清单（侧栏用，游标分页），附最新K线日期。
+
+    ktype='etf' 时列出全部拉取到的 ETF —— 每日全市场快照会落 1600+ 只。
 
     两步走：① 用覆盖索引取本页 code（`code > after` 游标，常数时间，
                比 OFFSET 深翻页快十几倍）；② 再对本页 code 取名称与最新日期。
     """
-    sql = "SELECT DISTINCT code FROM kline WHERE ktype='stock'"
-    params: list = []
+    sql = "SELECT DISTINCT code FROM kline WHERE ktype=?"
+    params: list = [ktype]
     if after:
         sql += " AND code>?"
         params.append(after)
@@ -751,8 +892,8 @@ def list_stocks(conn, limit: int = 60, after: str | None = None) -> list[dict]:
         f"""SELECT k.code, COALESCE(s.name, k.code) AS name,
                    COALESCE(s.market, '') AS market, MAX(k.date) AS latest_kline
             FROM kline k LEFT JOIN stock_basic s ON s.code = k.code
-            WHERE k.ktype='stock' AND k.code IN ({ph})
-            GROUP BY k.code ORDER BY k.code""", codes).fetchall()
+            WHERE k.ktype=? AND k.code IN ({ph})
+            GROUP BY k.code ORDER BY k.code""", [ktype] + codes).fetchall()
     return [{"code": r["code"], "name": r["name"], "market": r["market"],
              "latest_kline": r["latest_kline"]} for r in rows]
 
@@ -763,6 +904,122 @@ def kline_span(conn, code: str) -> dict:
         "SELECT MIN(date) AS first, MAX(date) AS last, COUNT(*) AS n "
         "FROM kline WHERE code=?", (code,)).fetchone()
     return {"first": row["first"], "last": row["last"], "rows": row["n"] or 0}
+
+
+# =====================================================================
+# 指数元数据（stock_basic 里的 index 行）
+# ---------------------------------------------------------------------
+# 来源：baostock 文档 dataExplain.md 的「指数数据」10 张表（560+ 只指数）。
+# 注意 stock_basic 里 index 行的含义与个股不同：
+#   * listed_date = 指数**发布日期**（沿用改动前那 3 行指数的口径）；
+#   * industry 留空（那是个股行业），指数类别放 category。
+# =====================================================================
+
+#: upsert_index_meta 允许写入的列（列名会拼进 SQL，必须白名单化）
+INDEX_META_FIELDS = ("name", "full_name", "category", "publisher", "intro",
+                     "meta_src", "market", "listed_date")
+
+
+def upsert_index_meta(conn, rows_, batch: int = 200) -> dict:
+    """把指数元数据写进 stock_basic（UPSERT，只认指数行）。
+
+    返回 {"inserted": n, "updated": n, "skipped": [{"code","ktype"}, ...]}。
+
+    文档层的字段名是 `publish_date`（发布日期），库里沿用个股那一列 `listed_date`
+    （改动前那 3 行指数就是这么存的），所以这里做一次改名。
+
+    ⚠️ **ktype 不是 'index' 的行一律不碰**：自定义组合可以用任意代码
+    （实测 `sh.000922` 既是文档里的「中证红利」指数，也是用户建的组合），
+    盲目写入会把 portfolio 改成 index，组合直接失联。这类代码只记进 skipped。
+    """
+    now = _now()
+    existing = {r[0]: r[1] for r in
+                conn.execute("SELECT code, ktype FROM stock_basic")}
+    ins = upd = 0
+    skipped: list[dict] = []
+    for i, r in enumerate(rows_, 1):
+        code = r.get("code")
+        if not code:
+            continue
+        kt = existing.get(code)
+        if kt is not None and kt != "index":
+            skipped.append({"code": code, "ktype": kt})
+            continue
+        src = dict(r)
+        if not src.get("listed_date"):
+            src["listed_date"] = src.get("publish_date")
+        f = {k: src.get(k) for k in INDEX_META_FIELDS
+             if src.get(k) not in (None, "")}
+        if not f:
+            continue
+        f["ktype"] = "index"
+        if kt == "index":
+            sets = ",".join(f"{k}=?" for k in f)
+            conn.execute(
+                f"UPDATE stock_basic SET {sets}, updated_at=? WHERE code=?",
+                list(f.values()) + [now, code])
+            upd += 1
+        else:
+            cols = ",".join(f)
+            ph = ",".join("?" * len(f))
+            conn.execute(
+                f"INSERT INTO stock_basic(code,{cols},updated_at) VALUES(?,{ph},?)",
+                [code] + list(f.values()) + [now])
+            ins += 1
+        if i % batch == 0:
+            conn.commit()
+    conn.commit()
+    return {"inserted": ins, "updated": upd, "skipped": skipped}
+
+
+def index_meta_stats(conn) -> dict:
+    """指数元数据概览：总数 / 有简介数 / 分类分布（导入脚本核对用）。"""
+    total = conn.execute(
+        "SELECT COUNT(*) FROM stock_basic WHERE ktype='index'").fetchone()[0]
+    with_intro = conn.execute(
+        "SELECT COUNT(*) FROM stock_basic WHERE ktype='index' "
+        "AND intro IS NOT NULL AND intro<>''").fetchone()[0]
+    by_cat = {r[0] or "(无)": r[1] for r in conn.execute(
+        "SELECT category, COUNT(*) FROM stock_basic WHERE ktype='index' "
+        "GROUP BY category ORDER BY COUNT(*) DESC")}
+    return {"total": total, "with_intro": with_intro, "by_category": by_cat}
+
+
+def list_indexes(conn, limit: int = 60, after: str | None = None,
+                 category: str | None = None) -> list[dict]:
+    """指数清单（「指数与组合」页左侧浏览用，游标分页）。
+
+    与 list_stocks 不同：**不能从 kline 取代码** —— 560 多只指数里只有
+    少数几只（标的信息里的）有 K 线，从 kline 取会把绝大多数指数漏掉。
+    所以主表是 stock_basic，最新 K 线日期作为可空字段附上。
+    """
+    sql = ("SELECT code, name, full_name, category, publisher, listed_date "
+           "FROM stock_basic WHERE ktype='index'")
+    params: list = []
+    if category:
+        sql += " AND category=?"
+        params.append(category)
+    if after:
+        sql += " AND code>?"
+        params.append(after)
+    sql += " ORDER BY code LIMIT ?"
+    params.append(limit)
+    rows = [dict(r) for r in conn.execute(sql, params)]
+    if not rows:
+        return rows
+    latest = latest_kline_dates_for(conn, [r["code"] for r in rows])
+    for r in rows:
+        r["latest_kline"] = latest.get(r["code"])
+    return rows
+
+
+def index_categories(conn) -> list[str]:
+    """指数类别列表（浏览侧栏的下拉筛选用）。"""
+    return [r[0] for r in conn.execute(
+        "SELECT category FROM stock_basic WHERE ktype='index' "
+        "AND category IS NOT NULL AND category<>'' "
+        "GROUP BY category ORDER BY COUNT(*) DESC")]
+
 
 
 def update_stock_basic_info(conn, rows, batch: int = 300) -> int:

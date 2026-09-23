@@ -65,8 +65,12 @@ def asset_detail(code: str, _: None = Depends(deps.require_auth)):
         b = basics[0] if basics else {}
         sc = storage.latest_score(conn, code)
         krows = storage.load_kline(conn, code, fields=("date",) + METRIC_FIELDS
-                                   + ("close", "pct_chg"))
+                                   + ("close", "close_raw", "pct_chg"))
         latest_k = krows[-1] if krows else {}
+        # 只有不复权价的行（ETF / 每日快照刚落、还没补前复权的新股票）：
+        # 详情头部与基本信息卡的"最新收盘"跟 K 线图保持一致，也用 close_raw 兜底
+        if latest_k.get("close") is None and latest_k.get("close_raw") is not None:
+            latest_k["close"] = latest_k["close_raw"]
         span = storage.kline_span(conn, code)
         weights = t["weights"] if t else {}
         market = b.get("market") or (code.split(".")[0] if "." in code else None)
@@ -80,6 +84,11 @@ def asset_detail(code: str, _: None = Depends(deps.require_auth)):
             "market_label": {"sh": "上交所", "sz": "深交所"}.get(market, market or ""),
             "industry": b.get("industry"),
             "listed_date": b.get("listed_date"),
+            # 指数元数据（来自 baostock 文档导入，个股为 None）：详情页「指数资料」卡
+            "full_name": b.get("full_name"),
+            "category": b.get("category"),
+            "publisher": b.get("publisher"),
+            "intro": b.get("intro"),
             "weights": weights,
             "kline": {"rows": span["rows"], "first_date": span["first"],
                       "latest_date": latest_k.get("date"),
@@ -99,8 +108,15 @@ def asset_kline(code: str, years: int = 3, _: None = Depends(deps.require_auth))
     try:
         rows = storage.load_kline(
             conn, code, start=deps.years_ago(years),
-            fields=("date", "open", "high", "low", "close", "volume", "amount",
-                    "pct_chg", "turn"))
+            fields=("date", "open", "high", "low", "close", "close_raw",
+                    "volume", "amount", "pct_chg", "turn"))
+        # ETF（以及只被每日快照覆盖、还没补过前复权的新股票）只有不复权价：
+        # close 为空就回退用它，否则详情页 K 线图是**空白**。
+        # ETF 基本没有分红送股，两者差异可忽略。
+        for r in rows:
+            if r.get("close") is None and r.get("close_raw") is not None:
+                r["close"] = r["close_raw"]
+            r.pop("close_raw", None)
         return {"code": code, "years": years, "items": rows}
     finally:
         conn.close()

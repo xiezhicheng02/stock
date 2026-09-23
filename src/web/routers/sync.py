@@ -40,6 +40,55 @@ def stocks(after: str | None = None, limit: int = 60,
         conn.close()
 
 
+@router.get("/etfs", summary="ETF 清单（游标分页）")
+def etfs(after: str | None = None, limit: int = 60,
+         _: None = Depends(deps.require_auth)):
+    """「指数与组合」页左侧 ETF 列表用：每日全市场快照会落 1600+ 只 ETF。
+
+    和 /stocks 一样走游标分页（after=上一页最后一只代码），多取一条判断 has_more。
+    注意：ETF 只有**不复权价**（close_raw），没有前复权 close、也没有 PE/PB，
+    所以详情页的 K 线需要用 close_raw 画、估值区域基本为空。
+    """
+    limit = max(1, min(limit, 200))
+    conn = deps.conn()
+    try:
+        items = storage.list_stocks(conn, limit=limit + 1, after=after or None,
+                                    ktype="etf")
+        has_more = len(items) > limit
+        items = items[:limit]
+        return {"items": items, "limit": limit, "after": after,
+                "next_after": items[-1]["code"] if (items and has_more) else None,
+                "has_more": has_more}
+    finally:
+        conn.close()
+
+
+@router.get("/indexes", summary="指数清单（游标分页）")
+def indexes(after: str | None = None, limit: int = 60, category: str | None = None,
+            _: None = Depends(deps.require_auth)):
+    """「指数与组合」页左侧指数浏览列表用。
+
+    与 /stocks、/etfs 不同：数据来自 **stock_basic**（baostock 文档导入的 560+
+    只指数元数据），不是 kline —— 这些指数里只有少数几只（标的信息里的）有 K 线。
+
+    category 可选，按「综合指数 / 规模指数 / 一级行业指数 / …」筛选。
+    """
+    limit = max(1, min(limit, 200))
+    conn = deps.conn()
+    try:
+        items = storage.list_indexes(conn, limit=limit + 1, after=after or None,
+                                     category=category or None)
+        has_more = len(items) > limit
+        items = items[:limit]
+        return {"items": items, "limit": limit, "after": after,
+                "category": category,
+                "categories": storage.index_categories(conn),
+                "next_after": items[-1]["code"] if (items and has_more) else None,
+                "has_more": has_more}
+    finally:
+        conn.close()
+
+
 @router.post("/stock/{code}/sync", summary="拉取单只个股数据")
 def sync_stock(code: str, full: bool = False, _: None = Depends(deps.require_auth)):
     """拉历史K线 → 分红 → 实时算动态股息率写回 → 评分。"""
